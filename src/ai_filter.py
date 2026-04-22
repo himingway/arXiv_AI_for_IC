@@ -8,6 +8,7 @@ import os
 import json
 import time
 from typing import Tuple, Optional, Dict, Any
+from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 import anthropic
@@ -15,8 +16,9 @@ import anthropic
 from .database import Database, Paper
 
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from project root
+project_root = Path(__file__).parent.parent
+load_dotenv(project_root / '.env')
 
 
 class AIFilter:
@@ -24,27 +26,28 @@ class AIFilter:
     Supports both OpenAI-compatible APIs and Anthropic Claude API.
     """
 
-    SYSTEM_PROMPT = """你是一位资深的 SoC 架构师与 EDA 领域专家。你需要评估 ArXiv 论文与"芯片架构与 EDA 前沿"领域的相关性，并给出 1-10 分的评分：
+    SYSTEM_PROMPT = """你是一位资深的 SoC 互联架构专家。你需要评估 ArXiv 论文与"SoC 芯片互联架构"领域的相关性，并给出 1-10 分的评分：
 
 评分标准（越高表示越相关越重要）：
-10 分：突破性创新，直接针对 CPU/AI 芯片微架构、Cache 一致性协议、NoC、或 AI 驱动的 EDA 方法，具有重大理论或实践价值。必须精读。
-9 分：非常相关，高质量研究，对工业界或学术界有重要参考价值。强烈推荐阅读。
-8 分：相关且有新意，技术扎实，值得领域内关注。
-7 分：比较相关，有一定技术价值，可以一读。
-6 分：部分相关，某些概念或方法可能有参考意义。
-4-5 分：边缘相关，只有少量内容涉及目标领域。
-1-3 分：不相关，属于其他领域（如纯算法理论、纯软件、纯机器学习理论不涉及硬件）。
+10 分：突破性创新，直接针对 Cache 一致性协议、NoC 互连网络、片上总线，具有重大理论或实践价值。必须精读。
+9 分：非常相关，高质量研究，在互联架构领域有重要创新，强烈推荐阅读。
+8 分：相关且有新意，技术扎实，对互联领域有参考价值，值得关注。
+7 分：比较相关，主要内容围绕互联架构，有一定技术价值，可以一读。
+6 分：部分内容涉及互联架构，其他部分是系统级或 core 级讨论。
+4-5 分：边缘相关，只有少量内容提到互联，主要讨论其他主题。
+1-3 分：不相关，论文主题是 CPU core 设计、AI 张量单元、纯算法理论、纯软件、机器学习理论不涉及硬件互联。
 
-重点关注领域：
-1. CPU/AI 芯片架构：微架构创新、存储层级优化、张量单元设计、指令集创新、乱序执行、分支预测。
-2. 总线与一致性：AMBA CHI/ACE 协议、Cache Coherency 机制、NoC 拓扑、互连网络、内存一致性模型。
-3. EDA + AI：机器学习在 RTL 生成、物理设计（Placement & Routing）、逻辑综合、形式化验证、时序分析中的应用。
+重点关注领域（按优先级排序）：
+✅ 最高优先级：总线与一致性 — AMBA CHI/ACE 协议、Cache Coherency 机制、NoC 拓扑设计、片上互连网络、内存一致性模型、互联流量优化、一致性协议优化
+✅ 次高优先级：SoC 整体架构 — 存储层级优化、互连架构创新、多芯片互联、存算一体互联
+✅ 中等优先级：EDA + AI — 机器学习在物理设计、互联布线、一致性验证中的应用
+❌ 低优先级（降分处理）：CPU 核设计、AI 张量单元、指令集创新、乱序执行、分支预测 — 即使有创新，也只给低分，因为不是目标领域
 
 请严格按照 JSON 格式输出，不要其他文字：
 {
   "score": 1-10 的整数,
   "reason": "100字以内的推荐理由，说明为什么给这个分，重点说创新点在哪里",
-  "tags": "逗号分隔的技术标签，例如 CPU架构, 一致性协议, NoC, AI EDA, RTL生成 等"
+  "tags": "逗号分隔的技术标签，例如 一致性协议, NoC, CHI, ACE, 片上互联, 缓存一致性 等"
 }"""
 
     USER_PROMPT_TEMPLATE = """论文标题：{title}
@@ -60,20 +63,21 @@ class AIFilter:
         self.model = os.getenv('LLM_MODEL', 'gpt-4o')
         self.temperature = float(os.getenv('TEMPERATURE', '0.1'))
         self.max_tokens = int(os.getenv('MAX_TOKENS_SCORING', '2000'))
+        self.timeout = float(os.getenv('TIMEOUT_SCORING', '120'))  # 2 minutes timeout for scoring
 
         if self.provider == 'openai':
             self.base_url = os.getenv('BASE_URL', 'https://api.openai.com/v1')
             self.client = OpenAI(
                 base_url=self.base_url,
                 api_key=self.api_key,
-                timeout=60.0
+                timeout=self.timeout
             )
         elif self.provider == 'anthropic':
             self.base_url = os.getenv('ANTHROPIC_BASE_URL', 'https://api.anthropic.com')
             self.client = anthropic.Anthropic(
                 base_url=self.base_url,
                 api_key=self.api_key,
-                timeout=60.0
+                timeout=self.timeout
             )
         else:
             raise ValueError(f"Unsupported LLM provider: {self.provider}. Use 'openai' or 'anthropic'.")
@@ -138,18 +142,19 @@ class AIFilter:
             print("API key not configured. Cannot process papers.")
             return 0
 
-        unprocessed = db.get_unprocessed_papers()
+        # Fetch only as many papers as needed to avoid full table scan on each call
+        unprocessed = db.get_unprocessed_papers(limit=batch_size)
         processed = 0
 
-        for i, paper in enumerate(unprocessed[:batch_size]):
-            print(f"Processing {i+1}/{min(batch_size, len(unprocessed))}: {paper.title[:60]}...")
+        for i, paper in enumerate(unprocessed):
+            print(f"Processing {i+1}/{len(unprocessed)}: {paper.title[:60]}...")
             score, reason, tags = self.analyze_paper(paper)
 
             if score is not None:
                 db.update_ai_analysis(paper.id, score, reason, tags)
                 processed += 1
 
-            if i < batch_size - 1 and delay_seconds > 0:
+            if i < len(unprocessed) - 1 and delay_seconds > 0:
                 time.sleep(delay_seconds)
 
         return processed

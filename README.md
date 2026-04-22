@@ -5,45 +5,97 @@
 ## 功能特性
 
 - **定时自动同步**: 默认每日北京时间 08:00 自动抓取 `cs.AR`, `cs.DC`, `cs.ET`, `cs.AI` 分类论文
+- **增量同步优化**: 两阶段抓取 + 提前停止策略，快速增量同步，遇到连续已存在论文自动停止，避免浪费时间
+- **并行抓取**: 多线程并发抓取新论文详情，速度比串行快 3-5 倍
+- **支持双 LLM 协议**: 兼容 OpenAI 协议（OpenAI/Qwen/GLM/DeepSeek/Kimi/Doubao/火山方舟）和原生 Anthropic 协议（Claude）
 - **AI 智能评分**: LLM 扮演资深 SoC 架构师，按相关性给出 1-10 分评分，生成推荐理由和技术标签
 - **交互式看板**: Streamlit Web UI，支持按今日新增、高分、收藏筛选
+- **启动即检查今日同步状态**: 看板侧边栏实时提示“今日已同步/未同步”，并支持一键“补跑今日同步”
 - **深度推文生成**: 自动下载 PDF，提取核心章节，生成带专家点评的深度技术推文
 
-## 领域筛选重点
+## 领域筛选重点（当前配置侧重互联架构）
 
-1. **CPU/AI 芯片架构**: 微架构创新、存储层级优化、张量单元设计
-2. **总线与一致性**: AMBA CHI/ACE 协议、Cache Coherency、NoC 拓扑
-3. **EDA + AI**: 机器学习在 RTL 生成、P&R、形式化验证中的应用
+1. **⭐ 最高优先级：总线与一致性** - AMBA CHI/ACE 协议、Cache Coherency 机制、NoC 拓扑设计、片上互连网络、内存一致性模型、互联流量优化、一致性协议优化
+2. **⭐ 次高优先级：SoC 整体架构** - 存储层级优化、多芯片互联、存算一体互联架构
+3. **⭐ 中等优先级：EDA + AI** - 机器学习在 RTL 生成、物理设计（Placement & Routing）、互联布线、形式化验证中的应用
+4. **⚠️ 低优先级（自动降分）** - CPU 核心设计、AI 张量单元、指令集创新（即使有创新也会降低评分，因为不是目标领域）
+
+## 支持的 LLM 提供商
+
+| 提供商 | 协议 | 配置示例 |
+|--------|------|----------|
+| OpenAI 官方 | OpenAI | `LLM_PROVIDER=openai`, `BASE_URL=https://api.openai.com/v1` |
+| 通义千问 | OpenAI 兼容 | `LLM_PROVIDER=openai`, `BASE_URL=https://dashscope.aliyun.com/compatibility/v1` |
+| DeepSeek | OpenAI 兼容 | `LLM_PROVIDER=openai`, `BASE_URL=https://api.deepseek.com/v1` |
+| 智谱 GLM | OpenAI 兼容 | `LLM_PROVIDER=openai`, `BASE_URL=https://open.bigmodel.cn/api/paas/v4` |
+| 字节豆包 | OpenAI 兼容 | `LLM_PROVIDER=openai`, `BASE_URL=https://ark.cn-beijing.volces.com/api/v3` |
+| 火山方舟 | OpenAI 兼容 | `LLM_PROVIDER=openai`, `BASE_URL=https://ark.cn-beijing.volces.com/api/v3` |
+| Anthropic Claude | Anthropic 原生 | `LLM_PROVIDER=anthropic`, `ANTHROPIC_BASE_URL=https://api.anthropic.com` |
 
 ## 快速开始
 
 ### 1. 安装依赖
 
+**使用 pip:**
 ```bash
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+**使用 uv:**
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
 ### 2. 配置 API
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填入你的 BASE_URL 和 API_KEY
-# 适配 OpenAI / 通义千问 / 智谱清言 / DeepSeek 等
+# 编辑 .env，填入你的配置
 ```
 
-示例配置（通义千问）：
+**示例配置 - 火山方舟 OpenAI 兼容（推荐国内用户）:**
+```env
+LLM_PROVIDER=openai
+BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+API_KEY=your-ark-api-key
+LLM_MODEL=ep-xxxxxxxxxxxxxxxx  # 你的端点 ID
+TEMPERATURE=0.3
+MAX_TOKENS_SYNTHESIS=16384
+ARXIV_CATEGORIES=cs.AR,cs.DC,cs.ET,cs.AI
+TIMEOUT_SCORING=120
+TIMEOUT_SYNTHESIS=300
+TIMEOUT_DOWNLOAD=120
+DB_PATH=./data/papers.db
+PDF_DIR=./pdfs
 ```
-BASE_URL=https://dashscope.aliyun.com/compatibility/v1
-API_KEY=your_dashscope_api_key
-LLM_MODEL=qwen-plus
+
+**示例配置 - Anthropic Claude:**
+```env
+LLM_PROVIDER=anthropic
+ANTHROPIC_BASE_URL=https://api.anthropic.com
+API_KEY=your-anthropic-key
+LLM_MODEL=claude-3-5-sonnet-20241022
+TEMPERATURE=0.3
+MAX_TOKENS_SYNTHESIS=16384
+DB_PATH=./data/papers.db
+PDF_DIR=./pdfs
 ```
 
 ### 3. 首次同步
 
+默认抓取最新 100 篇（调试快速）：
 ```bash
 python main.py sync
+```
+
+指定抓取数量：
+```bash
+python main.py sync 500    # 抓取最新 500 篇
+python main.py sync 1000   # 抓取最新 1000 篇
 ```
 
 ### 4. AI 评分
@@ -52,74 +104,136 @@ python main.py sync
 python main.py process
 ```
 
+会分批处理所有未评分论文，遇到错误自动重试，中断后下次继续处理。
+
 ### 5. 启动交互式看板
 
 ```bash
 streamlit run app.py --server.address 0.0.0.0 --server.port 8501
 ```
 
-访问 `http://your-server:8501` 即可使用。
+使用 uv：
+```bash
+uv run streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+```
+
+访问 `http://your-server-ip:8501` 即可使用。
 
 ## 后台常驻运行（tmux）
 
+### Web 看板后台运行
+
 ```bash
-# 新建会话
-tmux new -s arxiv
-
-# 启动每日调度（会自动同步并后台运行）
-python main.py scheduler
-
-# Ctrl+B D 脱离会话，保持后台运行
+tmux new -s arxiv-dashboard
+source .venv/bin/activate
+uv run streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+# 按 Ctrl+B 然后 D 退出会话，保持后台运行
 ```
+
+### 每日自动同步
+
+```bash
+tmux new -s arxiv-scheduler
+source .venv/bin/activate
+uv run python main.py scheduler
+# 按 Ctrl+B 然后 D 退出会话
+```
+
+调度器会：
+- 每天 **北京时间 08:00** 自动同步最新论文（此时 ArXiv 已完成日更）
+- 启动时如果今天还没同步过，会立即同步一次
+- 自动同步后自动处理 10 篇新论文
 
 ## 命令行使用
 
 | 命令 | 说明 |
 |------|------|
-| `python main.py sync` | 手动触发一次同步 |
+| `python main.py sync` | 手动同步，默认抓取最新 100 篇 |
+| `python main.py sync N` | 指定抓取 N 篇，例如 `python main.py sync 500` |
 | `python main.py process` | 处理所有未评分论文 |
 | `python main.py scheduler` | 启动每日定时调度 |
 | `python main.py stats` | 查看数据库统计信息 |
+| `python main.py debug` | 调试：打印当前 LLM 配置 |
+| `python main.py clear` | 清空数据库（需要确认） |
+| `python main.py clear --pdf` | 清空数据库 AND 删除所有下载的 PDF |
 
 ## 项目结构
 
 ```
 arxiv/
 ├── app.py                 # Streamlit 交互式看板
-├── main.py                # CLI 入口
+├── main.py                # CLI 入口，支持所有命令
 ├── requirements.txt       # Python 依赖
-├── .env.example           # 环境变量示例
-├── src/
-│   ├── database.py        # SQLite 数据库封装
-│   ├── ingest.py          # ArXiv 数据抓取
-│   ├── ai_filter.py       # AI 评分筛选
-│   ├── pdf_parser.py      # PDF 下载与文本提取
-│   ├── deep_synthesis.py  # 深度推文生成
-│   └── scheduler.py       # 定时任务调度
-├── data/                  # SQLite 数据库存储
-└── pdfs/                  # 下载的 PDF 缓存
+├── .env.example           # 环境变量配置模板
+├── .gitignore            # Git 忽略规则
+└── src/
+    ├── __init__.py
+    ├── database.py        # SQLite 数据库封装
+    ├── ingest.py          # ArXiv 数据抓取（并行+提前停止优化）
+    ├── ai_filter.py       # AI 评分筛选（支持双协议）
+    ├── pdf_parser.py      # PDF 下载与核心章节文本提取
+    ├── deep_synthesis.py  # 深度推文生成（支持双协议）
+    └── scheduler.py       # 每日定时调度
 ```
+
+## 生成参数配置（可在 .env 中调整）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `TEMPERATURE` | 0.3 | 0.0-1.0，越低越稳定，越高越有创造性 |
+| `ARXIV_CATEGORIES` | `cs.AR,cs.DC,cs.ET,cs.AI` | 抓取分类，逗号分隔 |
+| `TIMEOUT_SCORING` | 120 | AI评分接口超时（秒） |
+| `TIMEOUT_SYNTHESIS` | 300 | 深度推文生成接口超时（秒） |
+| `TIMEOUT_DOWNLOAD` | 120 | PDF 下载超时（秒） |
+| `MAX_TOKENS_SCORING` | 2000 | AI评分最大输出长度 |
+| `MAX_TOKENS_SYNTHESIS` | 16384 | 深度推文最大输出长度，可根据模型支持调大到 65536 |
+
+## 同步优化说明
+
+### 两阶段并行抓取
+
+1. **快速扫描阶段**: 只获取论文 ID，检查是否已在数据库，收集需要抓取的新论文 ID
+2. **并行抓取阶段**: 对新论文 ID 并发获取详细元数据，3 线程并发 + 重试机制
+
+### 提前停止策略
+
+因为 ArXiv 按提交时间降序排序，如果连续遇到 20 篇已存在论文，说明所有更新的论文已经入库，后面更老的肯定都已经有了，可以安全提前停止，节省大量时间。**已经发现的新论文一定会全部抓取完成，不会漏抓**。
+
+## Web 看板功能
+
+- 默认按 AI 评分降序排列（高分在前）
+- 筛选选项：仅今日新增 / 仅高分必读 (≥7分) / 仅已收藏
+- 搜索支持：按标题/作者/标签搜索
+- 勾选论文后点击「生成深度推文」，自动下载 PDF 提取核心章节，生成带架构师点评的 Markdown
+- 生成后可直接下载 Markdown 文件
+
+## 深度推文内容结构
+
+生成的推文建议按以下逻辑组织（标题表达可灵活调整，更适合公众号/推文阅读）：
+1. **一句话硬核总结 (TL;DR)**
+2. **痛点与经典方案的瓶颈 (Background & Bottleneck)**
+3. **核心创新点拆解 (Core Innovation)**
+4. **【架构师深度横评与优缺点剖析】**
+    - 经典 vs 创新 (Horizontal Comparison)
+    - 核心优势 (Pros)
+    - 潜在缺陷与代价 (Cons & Trade-offs)
+    - 一句话实战启示
 
 ## 数据库 Schema
 
-- `papers`: 存储论文元数据、AI 评分、推荐理由、收藏标记
-- `sync_log`: 同步日志记录
+- `papers`: 存储论文元数据、AI 评分、推荐理由、标签、收藏标记
+- `sync_log`: 同步日志记录，包含每次同步添加数量和状态
 
 ## 技术栈
 
 - Python 3.10+
 - Streamlit - Web UI
-- SQLite - 本地存储
+- SQLite - 本地轻量存储
 - arxiv - ArXiv API 客户端
-- PyMuPDF - PDF 文本提取
-- OpenAI SDK - 大模型接口（兼容所有 OpenAI 格式 API）
-- APScheduler - 定时任务
-
-## 截图
-
-- 左侧边栏显示统计信息，提供同步和 AI 处理按钮
-- 主区域按 AI 分数降序排列，支持筛选今日新增、高分必读、已收藏
-- 勾选感兴趣论文后点击「生成深度推文」即可获得带专家点评的 Markdown
+- PyMuPDF (fitz) - PDF 文本提取
+- OpenAI SDK - OpenAI 协议支持
+- Anthropic SDK - Anthropic 协议支持
+- APScheduler - 定时任务调度
 
 ## License
 
