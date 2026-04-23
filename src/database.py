@@ -3,6 +3,7 @@ Database module for ArXiv paper tracking system.
 Handles SQLite operations for storing paper metadata and AI analysis results.
 """
 
+import os
 import sqlite3
 import datetime
 from contextlib import contextmanager
@@ -81,6 +82,10 @@ class Database:
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
+        # Ensure parent directory exists
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
