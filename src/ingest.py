@@ -48,10 +48,21 @@ class ArXivCrawler:
         categories = [item.strip() for item in raw.split(',') if item.strip()]
         return categories or cls.DEFAULT_CATEGORIES
 
-    def __init__(self, db: Database, categories: List[str] = None, max_results: int = 100):
+    def __init__(self, db: Database, categories: List[str] = None, max_results: int = None):
         self.db = db
         self.categories = categories or self.get_categories_from_env()
-        self.max_results = max_results
+        # Read MAX_RESULTS from environment if not explicitly given
+        if max_results is None:
+            max_results_env = os.getenv('MAX_RESULTS', '')
+            if max_results_env.strip():
+                try:
+                    self.max_results = int(max_results_env)
+                except ValueError:
+                    self.max_results = 100
+            else:
+                self.max_results = 100
+        else:
+            self.max_results = max_results
         self.client = arxiv.Client(
             page_size=100,
             delay_seconds=3,
@@ -184,7 +195,7 @@ class ArXivCrawler:
 def run_sync(db_path: str, categories: List[str] = None, max_results: int = None) -> SyncResult:
     """Helper function to run sync from command line."""
     db = Database(db_path)
-    if max_results is None:
-        max_results = 100  # Default
+    # If max_results not explicitly given from command line, let ArXivCrawler
+    # read it from MAX_RESULTS environment variable (fallback to 100 if not set)
     crawler = ArXivCrawler(db, categories=categories, max_results=max_results)
     return crawler.sync()
