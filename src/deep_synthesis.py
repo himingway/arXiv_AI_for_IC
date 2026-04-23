@@ -6,7 +6,7 @@ Supports both OpenAI-compatible APIs and Anthropic Claude API.
 
 import os
 import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -37,9 +37,6 @@ AI评分：{score}/10
 标签：{tags}
 摘要：{abstract}
 
-论文候选配图：
-{figures_summary}
-
 论文全文文本：
 ---
 {full_text}
@@ -53,8 +50,7 @@ AI评分：{score}/10
 4. **关键实验与数据支撑** (提炼对实际工程有指导意义的、最具代表性的性能指标提升/功耗面积开销分析)
 5. **深度横评与实战启示** (客观剖析该方案的精妙处以及潜在的妥协/短板/实现代价，并谈谈如果工业界落地可能遇到的挑战)
 
-要求：不要做浅尝辄止的表面文章，务必深入到技术细节；不要输出无关的免责声明。
-如果某段分析与候选配图明显对应，请在相关段落结尾插入对应引用标记，例如 [图1]、[图2]。只能引用给出的候选配图，不要杜撰新的图号；如果没有合适的配图，就不要强行插图。"""
+要求：不要做浅尝辄止的表面文章，务必深入到技术细节；不要输出无关的免责声明。"""
 
     def __init__(self):
         self.provider = os.getenv('LLM_PROVIDER', 'openai').lower()
@@ -85,19 +81,7 @@ AI评分：{score}/10
         """Check if API key is configured."""
         return bool(self.api_key and self.api_key != 'your_api_key_here')
 
-    def format_figures_summary(self, figures: Optional[List[Dict[str, Any]]]) -> str:
-        """Format extracted figure metadata for the synthesis prompt."""
-        if not figures:
-            return "无可用候选配图。"
-
-        lines = []
-        for figure in figures:
-            lines.append(
-                f"- [{figure['figure_key']}] 第{figure['page']}页，图注：{figure['caption']}"
-            )
-        return "\n".join(lines)
-
-    def synthesize_paper(self, paper: Paper, full_text: str, figures: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    def synthesize_paper(self, paper: Paper, full_text: str) -> Optional[str]:
         """Generate deep synthesis for a single paper."""
         if not self.is_configured():
             return None
@@ -108,7 +92,6 @@ AI评分：{score}/10
             score=paper.ai_score or 'N/A',
             tags=paper.ai_tags or 'N/A',
             abstract=paper.abstract,
-            figures_summary=self.format_figures_summary(figures),
             full_text=full_text
         )
 
@@ -166,8 +149,7 @@ AI评分：{score}/10
                 result += "---\n\n"
                 continue
 
-            figures = pdf_processor.extract_figures(paper)
-            synthesis = self.synthesize_paper(paper, full_text, figures=figures)
+            synthesis = self.synthesize_paper(paper, full_text)
             if synthesis is None:
                 result += f"## {i}. {paper.title}\n\n"
                 result += f"**作者**: {paper.authors}\n\n"
