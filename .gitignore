@@ -50,3 +50,6 @@ Thumbs.db
 
 # Claude
 .claude/
+
+# PID
+.services.pid
