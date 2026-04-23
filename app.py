@@ -3,6 +3,7 @@ Streamlit Interactive Dashboard for ArXiv Chip Architecture Paper Tracker.
 """
 
 import os
+import re
 import sys
 import datetime
 import streamlit as st
@@ -38,6 +39,8 @@ def init_session_state():
         st.session_state.ai_process_running = False
     if 'synthesis_result' not in st.session_state:
         st.session_state.synthesis_result = None
+    if 'synthesis_entries' not in st.session_state:
+        st.session_state.synthesis_entries = []
     if 'generating_synthesis' not in st.session_state:
         st.session_state.generating_synthesis = False
     if 'saved_synthesis_paper_ids' not in st.session_state:
@@ -72,9 +75,70 @@ def get_completed_paper_ids(content: str) -> set[str]:
     return completed_paper_ids
 
 
-def build_synthesis_entry(index: int, paper: Paper, body: str, include_arxiv_link: bool = False) -> str:
+def normalize_synthesis_entry(entry: str) -> str:
+    """Normalize a single synthesis entry for standalone display."""
+    normalized_entry = entry.strip()
+    while normalized_entry.endswith("---"):
+        normalized_entry = normalized_entry[:-3].rstrip()
+
+    lines = normalized_entry.splitlines()
+    if lines and re.match(r'^##\s+\d+\.\s+', lines[0]):
+        lines[0] = re.sub(r'^##\s+\d+\.\s+', '## ', lines[0], count=1)
+    return "\n".join(lines).strip()
+
+
+def parse_synthesis_entries(content: str) -> list[str]:
+    """Parse stored synthesis content into standalone per-paper entries."""
+    if not content:
+        return []
+
+    if PAPER_DONE_MARKER_PREFIX in content:
+        entries = []
+        current_lines = []
+        capturing = False
+
+        for line in content.splitlines():
+            if line.startswith(PAPER_DONE_MARKER_PREFIX) and line.endswith(PAPER_DONE_MARKER_SUFFIX):
+                if current_lines:
+                    entries.append(normalize_synthesis_entry("\n".join(current_lines)))
+                current_lines = []
+                capturing = True
+                continue
+
+            if capturing:
+                current_lines.append(line)
+
+        if current_lines:
+            entries.append(normalize_synthesis_entry("\n".join(current_lines)))
+
+        return [entry for entry in entries if entry]
+
+    heading_pattern = re.compile(r'(?m)^##\s+(?:\d+\.\s+)?[^\n]+\n\n\*\*作者\*\*:')
+    matches = list(heading_pattern.finditer(content))
+    if not matches:
+        return [normalize_synthesis_entry(content)] if content.strip() else []
+
+    entries = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+        entry = normalize_synthesis_entry(content[start:end])
+        if entry:
+            entries.append(entry)
+    return entries
+
+
+def get_synthesis_entry_title(entry: str) -> str:
+    """Extract the paper title from a single synthesis entry."""
+    first_line = entry.strip().splitlines()[0] if entry.strip() else ""
+    if first_line.startswith("## "):
+        return first_line[3:].strip()
+    return "深度推文"
+
+
+def build_synthesis_entry(paper: Paper, body: str, include_arxiv_link: bool = False) -> str:
     """Build the markdown entry for a single paper."""
-    entry = f"## {index}. {paper.title}\n\n"
+    entry = f"## {paper.title}\n\n"
     entry += f"**作者**: {paper.authors}\n\n"
     entry += f"评分: **{paper.ai_score}/10** 标签: {paper.ai_tags}\n\n"
     if include_arxiv_link:
@@ -374,6 +438,7 @@ def main():
                     with col1:
                         if st.button("📂", key="load_history", use_container_width=True, help="在主界面加载此推文"):
                             st.session_state.synthesis_result = selected_synth['content']
+                            st.session_state.synthesis_entries = parse_synthesis_entries(selected_synth['content'])
                             st.rerun()
                     with col2:
                         st.download_button(
@@ -455,6 +520,8 @@ def main():
             if st.button("📝 生成深度推文", use_container_width=True):
                 if 'partial_synthesis' in st.session_state:
                     del st.session_state.partial_synthesis
+                st.session_state.synthesis_entries = []
+                st.session_state.synthesis_result = None
                 st.session_state.saved_synthesis_paper_ids = set()
                 st.session_state.synthesis_queue = selected_paper_ids
                 st.session_state.generating_synthesis = True
@@ -474,11 +541,13 @@ def main():
         status_text = st.empty()
         completed_paper_ids = set()
         saved_paper_ids = set(st.session_state.saved_synthesis_paper_ids)
+        synthesis_entries = []
         # Resume from partial result in session if we have it (interrupted by refresh)
         if 'partial_synthesis' in st.session_state:
             synthesis_result = st.session_state.partial_synthesis
             completed_paper_ids = get_completed_paper_ids(synthesis_result)
             completed_paper_ids.update(saved_paper_ids)
+            synthesis_entries = parse_synthesis_entries(synthesis_result)
             if completed_paper_ids:
                 st.info(f"恢复之前生成到一半的结果，已完成 {len(completed_paper_ids)}/{len(selected_paper_objs)} 篇...")
         else:
@@ -516,7 +585,6 @@ def main():
                     include_arxiv_link = True
 
             entry_content = build_synthesis_entry(
-                i,
                 paper,
                 entry_body,
                 include_arxiv_link=include_arxiv_link,
@@ -529,12 +597,14 @@ def main():
             synthesis_result += f"{paper_marker}\n"
             synthesis_result += entry_content
             synthesis_result += "\n\n---\n\n"
+            synthesis_entries.append(entry_content)
             completed_paper_ids.add(paper.id)
             st.session_state.partial_synthesis = synthesis_result
 
         progress_bar.progress(1.0)
         status_text.empty()
         st.session_state.synthesis_result = synthesis_result
+        st.session_state.synthesis_entries = synthesis_entries
         # Clear partial result
         if 'partial_synthesis' in st.session_state:
             del st.session_state.partial_synthesis
@@ -553,20 +623,36 @@ def main():
             mime="text/markdown"
         )
 
-    # Display existing synthesis result if any (after generation or loaded from history)
-    if st.session_state.synthesis_result:
-        with st.expander("📄 生成的深度推文（点击展开/收起）", expanded=True):
-            st.markdown(st.session_state.synthesis_result)
-            # Add download button
-            st.download_button(
-                label="⬇️ 下载 Markdown 文件",
-                data=st.session_state.synthesis_result,
-                file_name=f"arxiv-selection-{datetime.datetime.now().strftime('%Y%m%d')}.md",
-                mime="text/markdown"
-            )
+    # Display existing synthesis results as separate entries.
+    if st.session_state.synthesis_entries:
+        st.subheader("📄 生成的深度推文")
+        for index, entry in enumerate(st.session_state.synthesis_entries, 1):
+            entry_title = get_synthesis_entry_title(entry)
+            with st.expander(entry_title, expanded=index == 1):
+                st.markdown(entry)
+                st.download_button(
+                    label="⬇️ 下载当前 Markdown",
+                    data=entry,
+                    file_name=f"arxiv-synthesis-{index}-{datetime.datetime.now().strftime('%Y%m%d')}.md",
+                    mime="text/markdown",
+                    key=f"download_entry_{index}"
+                )
+
+        action_col1, action_col2 = st.columns([1, 3])
+        with action_col1:
             if st.button("🗑️ 清空结果"):
                 st.session_state.synthesis_result = None
+                st.session_state.synthesis_entries = []
                 st.rerun()
+        with action_col2:
+            if len(st.session_state.synthesis_entries) > 1 and st.session_state.synthesis_result:
+                st.download_button(
+                    label="⬇️ 下载全部 Markdown",
+                    data=st.session_state.synthesis_result,
+                    file_name=f"arxiv-selection-{datetime.datetime.now().strftime('%Y%m%d')}.md",
+                    mime="text/markdown",
+                    key="download_all_entries"
+                )
 
         st.divider()
 
@@ -635,6 +721,7 @@ def main():
                                 with col_synth2:
                                     if st.button("📂 加载", key=f"load_synth_{synth['id']}_{paper.id}"):
                                         st.session_state.synthesis_result = synth['content']
+                                        st.session_state.synthesis_entries = parse_synthesis_entries(synth['content'])
                                         st.rerun()
 
                 with st.expander("📝 摘要", expanded=False):
