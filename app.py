@@ -5,6 +5,8 @@ Streamlit Interactive Dashboard for ArXiv Chip Architecture Paper Tracker.
 import os
 import re
 import sys
+import io
+import zipfile
 import datetime
 import streamlit as st
 from dotenv import load_dotenv
@@ -15,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.database import Database, Paper
 from src.ingest import ArXivCrawler, SyncResult
 from src.ai_filter import AIFilter
+from src.embedding_similarity import EmbeddingSimilarityMatcher
 from src.pdf_parser import PDFProcessor
 from src.deep_synthesis import DeepSynthesizer
 
@@ -27,6 +30,30 @@ PDF_DIR = os.getenv('PDF_DIR', './pdfs')
 MIN_SCORE_DEFAULT = 7
 PAPER_DONE_MARKER_PREFIX = "<!-- PAPER_DONE:"
 PAPER_DONE_MARKER_SUFFIX = " -->"
+FALLBACK_PAPER_FIGURES_CACHE: dict[str, list[dict]] = {}
+_embedding_matcher: EmbeddingSimilarityMatcher | None = None
+SEMANTIC_HINT_GROUPS = {
+    'architecture': (
+        '架构', '组件', '模块', '拓扑', '目录', '客户端', '系统设计', '体系结构',
+        'architecture', 'architectural', 'component', 'components', 'topology', 'client', 'directory', 'overview'
+    ),
+    'protocol': (
+        '协议', '状态机', '一致性', '状态流转', '共享状态',
+        'protocol', 'coherence', 'state machine', 'state transition', 'directory state'
+    ),
+    'experiment': (
+        '实验', '评估', '测试', '性能', '吞吐', '时延', '延迟', '带宽', '速度提升',
+        'experiment', 'evaluation', 'benchmark', 'latency', 'bandwidth', 'throughput', 'iops', 'speedup', 'performance'
+    ),
+    'setup': (
+        '实验设置', '平台', '环境', '配置', '仿真', '模拟',
+        'setup', 'environment', 'configuration', 'emulation'
+    ),
+    'memory': (
+        '缓存', '页', '页缓存', '远程内存', '共享内存', 'dram', 'cxl',
+        'cache', 'page', 'memory', 'dram', 'cxl', 'remote memory'
+    ),
+}
 
 
 def init_session_state():
@@ -45,6 +72,26 @@ def init_session_state():
         st.session_state.generating_synthesis = False
     if 'saved_synthesis_paper_ids' not in st.session_state:
         st.session_state.saved_synthesis_paper_ids = set()
+    if 'paper_figures_cache' not in st.session_state:
+        st.session_state.paper_figures_cache = {}
+
+
+def get_paper_figures_cache() -> dict[str, list[dict]]:
+    """Return the figure cache, even when code runs outside a Streamlit session."""
+    try:
+        if 'paper_figures_cache' not in st.session_state:
+            st.session_state.paper_figures_cache = {}
+        return st.session_state.paper_figures_cache
+    except Exception:
+        return FALLBACK_PAPER_FIGURES_CACHE
+
+
+def get_embedding_matcher() -> EmbeddingSimilarityMatcher:
+    """Create or reuse the embedding matcher."""
+    global _embedding_matcher
+    if _embedding_matcher is None:
+        _embedding_matcher = EmbeddingSimilarityMatcher()
+    return _embedding_matcher
 
 
 def get_db():
@@ -148,6 +195,303 @@ def build_synthesis_entry(paper: Paper, body: str, include_arxiv_link: bool = Fa
     entry += "---\n\n"
     entry += body.strip()
     return entry
+
+
+def extract_paper_id_from_entry(entry: str) -> str | None:
+    """Extract the paper ID from a synthesis entry."""
+    arxiv_link_match = re.search(r'ArXiv:\s*\[([^\]]+)\]\(', entry)
+    if arxiv_link_match:
+        return arxiv_link_match.group(1).strip()
+
+    pdf_link_match = re.search(r'https?://[^\s)]+/(?:pdf|abs)/([A-Za-z0-9._-]+)', entry)
+    if not pdf_link_match:
+        return None
+
+    paper_id = pdf_link_match.group(1).strip().rstrip('/')
+    if paper_id.lower().endswith('.pdf'):
+        paper_id = paper_id[:-4]
+    return paper_id or None
+
+
+def get_entry_figure_refs(entry: str) -> list[str]:
+    """Return unique figure references in first-appearance order."""
+    figure_refs = []
+    seen_refs = set()
+    for match in re.finditer(r'\[(图\d+)\]', entry):
+        figure_key = match.group(1)
+        if figure_key not in seen_refs:
+            seen_refs.add(figure_key)
+            figure_refs.append(figure_key)
+    return figure_refs
+
+
+def is_content_block(block: str) -> bool:
+    """Return whether a markdown block is substantive content for figure placement."""
+    stripped = block.strip()
+    if not stripped:
+        return False
+    if stripped.startswith('## '):
+        return False
+    if stripped.startswith('**作者**'):
+        return False
+    if stripped.startswith('评分:'):
+        return False
+    if stripped.startswith('ArXiv:'):
+        return False
+    if stripped.startswith('原文链接:'):
+        return False
+    if stripped == '---':
+        return False
+    return len(stripped) >= 12
+
+
+def build_block_embedding_text(block: str) -> str:
+    """Prepare a paragraph for embedding similarity scoring."""
+    return f"推文段落：{block.strip()}"
+
+
+def build_figure_embedding_text(figure: dict) -> str:
+    """Prepare a figure caption for embedding similarity scoring."""
+    return f"论文图注：{figure['caption']}"
+
+
+def extract_similarity_tokens(text: str) -> set[str]:
+    """Extract lightweight keyword tokens for fallback matching."""
+    normalized = text.lower()
+    english_tokens = set(re.findall(r'[a-z][a-z0-9_+-]{1,}', normalized))
+    numeric_tokens = set(re.findall(r'\b\d+(?:\.\d+)?(?:x|kb|mb|gb|tb|ns|us|ms|s|%)?\b', normalized))
+    acronym_tokens = {
+        token for token in english_tokens
+        if token.isupper() or token in {'cxl', 'dram', 'nvme', 'fio', 'iops'}
+    }
+    return english_tokens | numeric_tokens | acronym_tokens
+
+
+def get_semantic_hints(text: str) -> set[str]:
+    """Map text to coarse semantic labels for fallback matching."""
+    normalized = text.lower()
+    hints = set()
+    for label, keywords in SEMANTIC_HINT_GROUPS.items():
+        for keyword in keywords:
+            if keyword in text or keyword in normalized:
+                hints.add(label)
+                break
+    return hints
+
+
+def score_block_figure_fallback(block: str, figure: dict) -> float:
+    """Fallback score when embeddings are unavailable."""
+    if not is_content_block(block):
+        return -1.0
+
+    block_tokens = extract_similarity_tokens(block)
+    caption_tokens = extract_similarity_tokens(figure['caption'])
+    token_overlap = block_tokens & caption_tokens
+
+    block_hints = get_semantic_hints(block)
+    caption_hints = get_semantic_hints(figure['caption'])
+    hint_overlap = block_hints & caption_hints
+
+    score = 0.0
+    score += len(token_overlap) * 2.2
+    score += len(hint_overlap) * 4.5
+
+    if block.strip().startswith('###'):
+        score -= 1.0
+    if len(block) > 120:
+        score += 0.4
+    return score
+
+
+def plan_entry_figures(entry: str, figures: list[dict]) -> tuple[list[str], dict[int, list[dict]], list[dict]]:
+    """Plan figure placement for an entry using explicit refs first, then embedding similarity."""
+    blocks = [block.strip() for block in re.split(r'\n{2,}', entry.strip()) if block.strip()]
+    assignments = {index: [] for index in range(len(blocks))}
+    figure_map = {figure['figure_key']: figure for figure in figures}
+    assigned_figure_keys = set()
+
+    for index, block in enumerate(blocks):
+        for figure_key in get_entry_figure_refs(block):
+            if figure_key in figure_map and figure_key not in assigned_figure_keys:
+                assignments[index].append(figure_map[figure_key])
+                assigned_figure_keys.add(figure_key)
+
+    candidate_indices = [index for index, block in enumerate(blocks) if is_content_block(block)]
+    remaining_figures = [
+        figure for figure in figures
+        if figure['figure_key'] not in assigned_figure_keys
+    ]
+    unmatched_figures = []
+
+    if not candidate_indices or not remaining_figures:
+        unmatched_figures.extend(remaining_figures)
+        return blocks, assignments, unmatched_figures
+
+    matcher = get_embedding_matcher()
+    similarity_matrix = None
+    if matcher.is_configured():
+        block_texts = [build_block_embedding_text(blocks[index]) for index in candidate_indices]
+        figure_texts = [build_figure_embedding_text(figure) for figure in remaining_figures]
+        similarity_matrix = matcher.similarity_matrix(block_texts, figure_texts)
+
+    if similarity_matrix is None:
+        for figure in remaining_figures:
+            best_index = None
+            best_score = 0.0
+            for index in candidate_indices:
+                score = score_block_figure_fallback(blocks[index], figure)
+                if score > best_score:
+                    best_index = index
+                    best_score = score
+
+            if best_index is not None and best_score >= 4.5:
+                assignments[best_index].append(figure)
+            else:
+                unmatched_figures.append(figure)
+        return blocks, assignments, unmatched_figures
+
+    scored_assignments: dict[int, list[tuple[float, dict]]] = {index: [] for index in range(len(blocks))}
+    for figure_position, figure in enumerate(remaining_figures):
+        best_candidate_position = None
+        best_score = float('-inf')
+        for candidate_position, candidate_index in enumerate(candidate_indices):
+            score = similarity_matrix[candidate_position][figure_position]
+            if score > best_score:
+                best_candidate_position = candidate_index
+                best_score = score
+
+        if best_candidate_position is not None and best_score >= matcher.similarity_threshold:
+            scored_assignments[best_candidate_position].append((best_score, figure))
+            assigned_figure_keys.add(figure['figure_key'])
+        else:
+            unmatched_figures.append(figure)
+
+    for block_index, scored_figures in scored_assignments.items():
+        if not scored_figures:
+            continue
+        scored_figures.sort(key=lambda item: item[0], reverse=True)
+        assignments[block_index].extend(figure for _, figure in scored_figures)
+
+    return blocks, assignments, unmatched_figures
+
+
+def make_safe_package_name(value: str) -> str:
+    """Create a filesystem-safe name for markdown package files."""
+    safe_name = re.sub(r'[^\w\u4e00-\u9fff.-]+', '-', value).strip('-.')
+    return safe_name or 'synthesis'
+
+
+def build_entry_markdown_with_images(entry: str, figures: list[dict], assets_dir: str) -> tuple[str, list[dict]]:
+    """Insert relative image links into markdown using the same placement plan as the UI."""
+    blocks, assignments, unmatched_figures = plan_entry_figures(entry, figures)
+    output_lines = []
+    included_figures = []
+
+    for index, block in enumerate(blocks):
+        output_lines.append(block)
+        output_lines.append('')
+        for figure in assignments.get(index, []):
+            image_name = os.path.basename(figure['image_path'])
+            relative_path = f"{assets_dir}/{image_name}"
+            output_lines.append(f"![{figure['figure_key']} - {figure['caption']}]({relative_path})")
+            output_lines.append('')
+            output_lines.append(f"> {figure['figure_key']} · 第{figure['page']}页 · {figure['caption']}")
+            output_lines.append('')
+            included_figures.append(figure)
+
+    if unmatched_figures:
+        output_lines.append('## 配图补充')
+        output_lines.append('')
+        for figure in unmatched_figures:
+            image_name = os.path.basename(figure['image_path'])
+            relative_path = f"{assets_dir}/{image_name}"
+            output_lines.append(f"![{figure['figure_key']} - {figure['caption']}]({relative_path})")
+            output_lines.append('')
+            output_lines.append(f"> {figure['figure_key']} · 第{figure['page']}页 · {figure['caption']}")
+            output_lines.append('')
+            included_figures.append(figure)
+
+    return '\n'.join(output_lines).strip() + '\n', included_figures
+
+
+def build_markdown_package(entries: list[str], db: Database, pdf_processor: PDFProcessor) -> bytes:
+    """Create a zip package with per-entry markdown and related images."""
+    package_buffer = io.BytesIO()
+    readme_lines = ['# ArXiv 深度推文 Markdown 包', '', '包含内容：', '']
+    combined_entries = []
+    written_assets = set()
+
+    with zipfile.ZipFile(package_buffer, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+        for index, entry in enumerate(entries, 1):
+            paper_id = extract_paper_id_from_entry(entry) or f'entry-{index:02d}'
+            title = get_synthesis_entry_title(entry)
+            figures = get_paper_figures(paper_id, db, pdf_processor)
+            assets_dir = f"assets/{make_safe_package_name(paper_id)}"
+            markdown_text, used_figures = build_entry_markdown_with_images(entry, figures, assets_dir)
+            markdown_name = f"{index:02d}-{make_safe_package_name(paper_id)}.md"
+
+            archive.writestr(markdown_name, markdown_text)
+            combined_entries.append(markdown_text)
+            readme_lines.append(f"- {markdown_name} : {title}")
+
+            for figure in used_figures:
+                asset_name = f"{assets_dir}/{os.path.basename(figure['image_path'])}"
+                if asset_name in written_assets:
+                    continue
+                if not os.path.exists(figure['image_path']):
+                    continue
+                with open(figure['image_path'], 'rb') as image_file:
+                    archive.writestr(asset_name, image_file.read())
+                written_assets.add(asset_name)
+
+        archive.writestr('README.md', '\n'.join(readme_lines).strip() + '\n')
+        archive.writestr('all.md', '\n\n---\n\n'.join(combined_entries).strip() + '\n')
+
+    package_buffer.seek(0)
+    return package_buffer.getvalue()
+
+
+def get_paper_figures(paper_id: str | None, db: Database, pdf_processor: PDFProcessor) -> list[dict]:
+    """Load extracted figures for a paper with a small session cache."""
+    if not paper_id:
+        return []
+
+    figure_cache = get_paper_figures_cache()
+    cached_figures = figure_cache.get(paper_id)
+    if cached_figures is not None:
+        return cached_figures
+
+    paper = db.get_paper(paper_id)
+    if paper is None:
+        figure_cache[paper_id] = []
+        return []
+
+    figures = pdf_processor.extract_figures(paper)
+    figure_cache[paper_id] = figures
+    return figures
+
+
+def render_synthesis_entry(entry: str, figures: list[dict]) -> None:
+    """Render a synthesis entry and insert related figures near their references."""
+    blocks, assignments, remaining_figures = plan_entry_figures(entry, figures)
+
+    for index, block in enumerate(blocks):
+        st.markdown(block)
+        for figure in assignments.get(index, []):
+            st.image(
+                figure['image_path'],
+                caption=f"{figure['figure_key']} · 第{figure['page']}页 · {figure['caption']}",
+                use_container_width=True,
+            )
+
+    if remaining_figures:
+        with st.expander("🖼️ 论文配图", expanded=False):
+            for figure in remaining_figures:
+                st.image(
+                    figure['image_path'],
+                    caption=f"{figure['figure_key']} · 第{figure['page']}页 · {figure['caption']}",
+                    use_container_width=True,
+                )
 
 
 def get_selected_paper_ids_in_order(papers: list[Paper]) -> list[str]:
@@ -556,9 +900,6 @@ def main():
             synthesis_result += "---\n\n"
             st.session_state.partial_synthesis = synthesis_result
 
-        synthesizer = DeepSynthesizer()
-        pdf_processor = PDFProcessor(PDF_DIR)
-
         for i, paper in enumerate(selected_paper_objs, 1):
             # Skip papers already completed in a previous partial run.
             if paper.id in completed_paper_ids:
@@ -577,7 +918,9 @@ def main():
             if full_text is None:
                 entry_body = "PDF 下载失败，无法生成深度分析。"
             else:
-                synthesis = synthesizer.synthesize_paper(paper, full_text)
+                figures = pdf_processor.extract_figures(paper)
+                get_paper_figures_cache()[paper.id] = figures
+                synthesis = synthesizer.synthesize_paper(paper, full_text, figures=figures)
                 if synthesis is None:
                     entry_body = "AI 生成失败。"
                 else:
@@ -628,14 +971,24 @@ def main():
         st.subheader("📄 生成的深度推文")
         for index, entry in enumerate(st.session_state.synthesis_entries, 1):
             entry_title = get_synthesis_entry_title(entry)
+            entry_paper_id = extract_paper_id_from_entry(entry)
+            entry_figures = get_paper_figures(entry_paper_id, db, pdf_processor)
             with st.expander(entry_title, expanded=index == 1):
-                st.markdown(entry)
+                render_synthesis_entry(entry, entry_figures)
+                entry_package = build_markdown_package([entry], db, pdf_processor)
                 st.download_button(
                     label="⬇️ 下载当前 Markdown",
                     data=entry,
                     file_name=f"arxiv-synthesis-{index}-{datetime.datetime.now().strftime('%Y%m%d')}.md",
                     mime="text/markdown",
                     key=f"download_entry_{index}"
+                )
+                st.download_button(
+                    label="🗂️ 下载当前 Markdown 包",
+                    data=entry_package,
+                    file_name=f"arxiv-synthesis-{index}-{datetime.datetime.now().strftime('%Y%m%d')}.zip",
+                    mime="application/zip",
+                    key=f"download_entry_package_{index}"
                 )
 
         action_col1, action_col2 = st.columns([1, 3])
@@ -645,14 +998,25 @@ def main():
                 st.session_state.synthesis_entries = []
                 st.rerun()
         with action_col2:
-            if len(st.session_state.synthesis_entries) > 1 and st.session_state.synthesis_result:
+            all_package = build_markdown_package(st.session_state.synthesis_entries, db, pdf_processor)
+            package_col1, package_col2 = st.columns(2)
+            with package_col1:
                 st.download_button(
-                    label="⬇️ 下载全部 Markdown",
-                    data=st.session_state.synthesis_result,
-                    file_name=f"arxiv-selection-{datetime.datetime.now().strftime('%Y%m%d')}.md",
-                    mime="text/markdown",
-                    key="download_all_entries"
+                    label="🗂️ 下载 Markdown 打包",
+                    data=all_package,
+                    file_name=f"arxiv-selection-package-{datetime.datetime.now().strftime('%Y%m%d')}.zip",
+                    mime="application/zip",
+                    key="download_markdown_package"
                 )
+            with package_col2:
+                if len(st.session_state.synthesis_entries) > 1 and st.session_state.synthesis_result:
+                    st.download_button(
+                        label="⬇️ 下载全部 Markdown",
+                        data=st.session_state.synthesis_result,
+                        file_name=f"arxiv-selection-{datetime.datetime.now().strftime('%Y%m%d')}.md",
+                        mime="text/markdown",
+                        key="download_all_entries"
+                    )
 
         st.divider()
 

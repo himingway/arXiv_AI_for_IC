@@ -71,6 +71,13 @@ TIMEOUT_SYNTHESIS=300
 TIMEOUT_DOWNLOAD=120
 DB_PATH=./data/papers.db
 PDF_DIR=./pdfs
+
+# 段落/图注 embedding 相似度排序（可选，但推荐开启）
+# 如果聊天模型走的是 /api/coding/v3，embedding 建议改用标准 OpenAI 兼容入口
+EMBEDDING_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+EMBEDDING_MODEL=your-embedding-endpoint-id
+EMBEDDING_TIMEOUT=60
+EMBEDDING_SIMILARITY_THRESHOLD=0.18
 ```
 
 **示例配置 - Anthropic Claude:**
@@ -188,6 +195,10 @@ arxiv/
 | `TIMEOUT_DOWNLOAD` | 120 | PDF 下载超时（秒） |
 | `MAX_TOKENS_SCORING` | 2000 | AI评分最大输出长度 |
 | `MAX_TOKENS_SYNTHESIS` | 16384 | 深度推文最大输出长度，可根据模型支持调大到 65536 |
+| `EMBEDDING_BASE_URL` | 跟随 `BASE_URL`，若为 Ark coding 入口会自动改成 `/api/v3` | 段落/图注 embedding 服务地址 |
+| `EMBEDDING_MODEL` | 空 | 段落/图注相似度排序使用的 embedding endpoint / model |
+| `EMBEDDING_SIMILARITY_THRESHOLD` | 0.18 | 图片自动挂载到段落的最小 cosine 相似度阈值 |
+| `EMBEDDING_CACHE_PATH` | `./data/embedding_cache.json` | embedding 向量缓存路径 |
 
 ## 同步说明
 
