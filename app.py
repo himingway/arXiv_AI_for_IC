@@ -36,6 +36,8 @@ def init_session_state():
         st.session_state.ai_process_running = False
     if 'synthesis_result' not in st.session_state:
         st.session_state.synthesis_result = None
+    if 'generating_synthesis' not in st.session_state:
+        st.session_state.generating_synthesis = False
 
 
 def get_db():
@@ -388,7 +390,131 @@ def main():
     # Display papers in a table-like format with checkboxes
     st.divider()
 
-    # Paper list (process selection first)
+    # Action bar for selected papers - TOP so you don't need to scroll to bottom
+    selected_count = len(st.session_state.selected_papers)
+    col_a, col_b = st.columns([3, 1], vertical_alignment="center")
+    with col_a:
+        st.markdown(f"##### 已选择 **{selected_count}** 篇论文")
+    with col_b:
+        if selected_count > 0 and not st.session_state.generating_synthesis:
+            if st.button("📝 生成深度推文", use_container_width=True):
+                st.session_state.generating_synthesis = True
+                st.rerun()
+        elif st.session_state.generating_synthesis:
+            st.button("📝 正在生成中...", disabled=True, use_container_width=True)
+
+    # Show warning once
+    if st.session_state.generating_synthesis:
+        st.warning("⚠️ 生成过程中请勿刷新或重复点击，刷新会中断生成，但是已完成内容会保存可断点续传。")
+
+    # Actual generation runs when generating_synthesis is True - TOP so you see progress/result immediately
+    if st.session_state.generating_synthesis:
+        selected_paper_objs = [p for pid in st.session_state.selected_papers if (p := db.get_paper(pid))]
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        # Resume from partial result in session if we have it (interrupted by refresh)
+        if 'partial_synthesis' in st.session_state:
+            synthesis_result = st.session_state.partial_synthesis
+            # Count how many are already done to skip them
+            done_count = synthesis_result.count("## ")
+            if done_count > 1:  # header counts as one
+                st.info(f"恢复之前生成到一半的结果，已完成 {done_count-1}/{len(selected_paper_objs)} 篇...")
+        else:
+            synthesis_result = f"# ArXiv 芯片架构前沿精选\n\n"
+            synthesis_result += f"生成时间：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+            synthesis_result += "---\n\n"
+            st.session_state.partial_synthesis = synthesis_result
+
+        synthesizer = DeepSynthesizer()
+        pdf_processor = PDFProcessor(PDF_DIR)
+
+        for i, paper in enumerate(selected_paper_objs, 1):
+            # Skip if this paper is already done in partial result
+            done_count = synthesis_result.count("## ")
+            if i < done_count:
+                progress_bar.progress(i / len(selected_paper_objs))
+                continue
+
+            progress = i / len(selected_paper_objs)
+            status_text.text(f"正在处理第 {i}/{len(selected_paper_objs)} 篇: {paper.title[:50]}...")
+            progress_bar.progress(progress)
+
+            # Get full text from PDF
+            full_text = pdf_processor.get_or_download(paper)
+            if full_text is None:
+                synthesis_result += f"## {i}. {paper.title}\n\n"
+                synthesis_result += f"**作者**: {paper.authors}\n\n"
+                synthesis_result += f"评分: **{paper.ai_score}/10** 标签: {paper.ai_tags}\n\n"
+                synthesis_result += f"PDF 下载失败，无法生成深度分析。\n\n"
+                synthesis_result += f"原文链接: {paper.pdf_url}\n\n"
+                synthesis_result += "---\n\n"
+                # Save partial result immediately after each paper
+                st.session_state.partial_synthesis = synthesis_result
+                continue
+
+            synthesis = synthesizer.synthesize_paper(paper, full_text)
+            if synthesis is None:
+                synthesis_result += f"## {i}. {paper.title}\n\n"
+                synthesis_result += f"**作者**: {paper.authors}\n\n"
+                synthesis_result += f"评分: **{paper.ai_score}/10** 标签: {paper.ai_tags}\n\n"
+                synthesis_result += f"AI 生成失败。\n\n"
+                synthesis_result += f"原文链接: {paper.pdf_url}\n\n"
+                synthesis_result += "---\n\n"
+                # Save partial result immediately after each paper
+                st.session_state.partial_synthesis = synthesis_result
+                continue
+
+            synthesis_result += f"## {i}. {paper.title}\n\n"
+            synthesis_result += f"**作者**: {paper.authors}\n\n"
+            synthesis_result += f"评分: **{paper.ai_score}/10** 标签: {paper.ai_tags}\n\n"
+            synthesis_result += f"ArXiv: [{paper.id}]({paper.pdf_url})\n\n"
+            synthesis_result += "---\n\n"
+            synthesis_result += synthesis
+            synthesis_result += "\n\n---\n\n"
+            # Save partial result immediately after each paper - so even if user refreshes,
+            # we don't lose what's already done and can resume from where we left off
+            st.session_state.partial_synthesis = synthesis_result
+
+        progress_bar.progress(1.0)
+        status_text.empty()
+        st.session_state.synthesis_result = synthesis_result
+        # Clear partial result
+        if 'partial_synthesis' in st.session_state:
+            del st.session_state.partial_synthesis
+        # Save to database
+        selected_ids = [p.id for p in selected_paper_objs]
+        db.save_synthesis(selected_ids, synthesis_result)
+        st.success(f"生成完成！已保存到数据库，共处理 {len(selected_paper_objs)} 篇论文")
+        # Reset generating state
+        st.session_state.generating_synthesis = False
+        # Auto-offer download immediately so it's not lost on refresh
+        filename = f"arxiv-selection-{datetime.datetime.now().strftime('%Y%m%d')}.md"
+        st.download_button(
+            label="⬇️ 立即下载 Markdown",
+            data=synthesis_result,
+            file_name=filename,
+            mime="text/markdown"
+        )
+
+    # Display existing synthesis result if any (after generation or loaded from history)
+    if st.session_state.synthesis_result:
+        with st.expander("📄 生成的深度推文（点击展开/收起）", expanded=True):
+            st.markdown(st.session_state.synthesis_result)
+            # Add download button
+            st.download_button(
+                label="⬇️ 下载 Markdown 文件",
+                data=st.session_state.synthesis_result,
+                file_name=f"arxiv-selection-{datetime.datetime.now().strftime('%Y%m%d')}.md",
+                mime="text/markdown"
+            )
+            if st.button("🗑️ 清空结果"):
+                st.session_state.synthesis_result = None
+                st.rerun()
+
+        st.divider()
+
+    # Paper list
+    st.divider()
     for paper in papers:
         with st.container():
             # Pre-fetched synth_by_paper mapping is built outside this loop (see above)
@@ -468,90 +594,6 @@ def main():
                     db.toggle_starred(paper.id)
                     st.rerun()
 
-    st.divider()
-
-    # Action bar for selected papers (after processing selection)
-    selected_count = len(st.session_state.selected_papers)
-    col_a, col_b = st.columns([4, 1], vertical_alignment="center")
-    with col_a:
-        st.markdown(f"##### 已选择 **{selected_count}** 篇论文")
-    with col_b:
-        if selected_count > 0:
-            if st.button("📝 生成深度推文", use_container_width=True):
-                selected_paper_objs = [p for pid in st.session_state.selected_papers if (p := db.get_paper(pid))]
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                synthesis_result = f"# ArXiv 芯片架构前沿精选\n\n"
-                synthesis_result += f"生成时间：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-                synthesis_result += "---\n\n"
-
-                for i, paper in enumerate(selected_paper_objs, 1):
-                    progress = i / len(selected_paper_objs)
-                    status_text.text(f"正在处理第 {i}/{len(selected_paper_objs)} 篇: {paper.title[:50]}...")
-                    progress_bar.progress(progress)
-
-                    # Get full text from PDF
-                    full_text = pdf_processor.get_or_download(paper)
-                    if full_text is None:
-                        synthesis_result += f"## {i}. {paper.title}\n\n"
-                        synthesis_result += f"**作者**: {paper.authors}\n\n"
-                        synthesis_result += f"评分: **{paper.ai_score}/10** 标签: {paper.ai_tags}\n\n"
-                        synthesis_result += f"PDF 下载失败，无法生成深度分析。\n\n"
-                        synthesis_result += f"原文链接: {paper.pdf_url}\n\n"
-                        synthesis_result += "---\n\n"
-                        continue
-
-                    synthesis = synthesizer.synthesize_paper(paper, full_text)
-                    if synthesis is None:
-                        synthesis_result += f"## {i}. {paper.title}\n\n"
-                        synthesis_result += f"**作者**: {paper.authors}\n\n"
-                        synthesis_result += f"评分: **{paper.ai_score}/10** 标签: {paper.ai_tags}\n\n"
-                        synthesis_result += f"AI 生成失败。\n\n"
-                        synthesis_result += f"原文链接: {paper.pdf_url}\n\n"
-                        synthesis_result += "---\n\n"
-                        continue
-
-                    synthesis_result += f"## {i}. {paper.title}\n\n"
-                    synthesis_result += f"**作者**: {paper.authors}\n\n"
-                    synthesis_result += f"评分: **{paper.ai_score}/10** 标签: {paper.ai_tags}\n\n"
-                    synthesis_result += f"ArXiv: [{paper.id}]({paper.pdf_url})\n\n"
-                    synthesis_result += "---\n\n"
-                    synthesis_result += synthesis
-                    synthesis_result += "\n\n---\n\n"
-
-                progress_bar.progress(1.0)
-                status_text.empty()
-                st.session_state.synthesis_result = synthesis_result
-                # Save to database
-                selected_ids = [p.id for p in selected_paper_objs]
-                db.save_synthesis(selected_ids, synthesis_result)
-                st.success(f"生成完成！已保存到数据库，共处理 {len(selected_paper_objs)} 篇论文")
-                # Auto-offer download immediately so it's not lost on refresh
-                filename = f"arxiv-selection-{datetime.datetime.now().strftime('%Y%m%d')}.md"
-                st.download_button(
-                    label="⬇️ 立即下载 Markdown",
-                    data=synthesis_result,
-                    file_name=filename,
-                    mime="text/markdown"
-                )
-        else:
-            st.button("📝 生成深度推文", disabled=True, use_container_width=True)
-
-    if st.session_state.synthesis_result:
-        with st.expander("📄 生成的深度推文（点击展开/收起）", expanded=True):
-            st.markdown(st.session_state.synthesis_result)
-            # Add download button
-            st.download_button(
-                label="⬇️ 下载 Markdown 文件",
-                data=st.session_state.synthesis_result,
-                file_name=f"arxiv-selection-{datetime.datetime.now().strftime('%Y%m%d')}.md",
-                mime="text/markdown"
-            )
-            if st.button("🗑️ 清空结果"):
-                st.session_state.synthesis_result = None
-                st.rerun()
-
-            st.divider()
 
 
 if __name__ == "__main__":
