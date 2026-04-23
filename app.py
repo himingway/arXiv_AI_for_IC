@@ -24,6 +24,8 @@ load_dotenv()
 DB_PATH = os.getenv('DB_PATH', './data/papers.db')
 PDF_DIR = os.getenv('PDF_DIR', './pdfs')
 MIN_SCORE_DEFAULT = 7
+PAPER_DONE_MARKER_PREFIX = "<!-- PAPER_DONE:"
+PAPER_DONE_MARKER_SUFFIX = " -->"
 
 
 def init_session_state():
@@ -52,6 +54,42 @@ def format_authors(authors: str, max_len: int = 45) -> str:
     if len(authors) <= max_len:
         return authors
     return authors[:max_len] + "..."
+
+
+def get_paper_done_marker(paper_id: str) -> str:
+    """Create an invisible marker so resume logic can count completed papers exactly."""
+    return f"{PAPER_DONE_MARKER_PREFIX}{paper_id}{PAPER_DONE_MARKER_SUFFIX}"
+
+
+def get_completed_paper_ids(content: str) -> set[str]:
+    """Extract completed paper IDs from the persisted partial synthesis."""
+    completed_paper_ids = set()
+    for line in content.splitlines():
+        if line.startswith(PAPER_DONE_MARKER_PREFIX) and line.endswith(PAPER_DONE_MARKER_SUFFIX):
+            completed_paper_ids.add(line[len(PAPER_DONE_MARKER_PREFIX):-len(PAPER_DONE_MARKER_SUFFIX)])
+    return completed_paper_ids
+
+
+def get_selected_paper_ids_in_order(papers: list[Paper]) -> list[str]:
+    """Sync checkbox widget state into session state and return a stable paper order."""
+    visible_paper_ids = {paper.id for paper in papers}
+    ordered_selected_ids = []
+
+    for paper in papers:
+        checkbox_key = f"select_{paper.id}"
+        default_selected = paper.id in st.session_state.selected_papers
+        if st.session_state.get(checkbox_key, default_selected):
+            ordered_selected_ids.append(paper.id)
+
+    hidden_selected_ids = sorted(
+        paper_id
+        for paper_id in st.session_state.selected_papers
+        if paper_id not in visible_paper_ids
+    )
+
+    all_selected_ids = ordered_selected_ids + hidden_selected_ids
+    st.session_state.selected_papers = set(all_selected_ids)
+    return all_selected_ids
 
 
 def main():
@@ -391,13 +429,17 @@ def main():
     st.divider()
 
     # Action bar for selected papers - TOP so you don't need to scroll to bottom
-    selected_count = len(st.session_state.selected_papers)
+    selected_paper_ids = get_selected_paper_ids_in_order(papers)
+    selected_count = len(selected_paper_ids)
     col_a, col_b = st.columns([3, 1], vertical_alignment="center")
     with col_a:
         st.markdown(f"##### 已选择 **{selected_count}** 篇论文")
     with col_b:
         if selected_count > 0 and not st.session_state.generating_synthesis:
             if st.button("📝 生成深度推文", use_container_width=True):
+                if 'partial_synthesis' in st.session_state:
+                    del st.session_state.partial_synthesis
+                st.session_state.synthesis_queue = selected_paper_ids
                 st.session_state.generating_synthesis = True
                 st.rerun()
         elif st.session_state.generating_synthesis:
@@ -409,16 +451,17 @@ def main():
 
     # Actual generation runs when generating_synthesis is True - TOP so you see progress/result immediately
     if st.session_state.generating_synthesis:
-        selected_paper_objs = [p for pid in st.session_state.selected_papers if (p := db.get_paper(pid))]
+        queued_paper_ids = st.session_state.get('synthesis_queue') or selected_paper_ids
+        selected_paper_objs = [p for pid in queued_paper_ids if (p := db.get_paper(pid))]
         progress_bar = st.progress(0)
         status_text = st.empty()
+        completed_paper_ids = set()
         # Resume from partial result in session if we have it (interrupted by refresh)
         if 'partial_synthesis' in st.session_state:
             synthesis_result = st.session_state.partial_synthesis
-            # Count how many are already done to skip them
-            done_count = synthesis_result.count("## ")
-            if done_count > 1:  # header counts as one
-                st.info(f"恢复之前生成到一半的结果，已完成 {done_count-1}/{len(selected_paper_objs)} 篇...")
+            completed_paper_ids = get_completed_paper_ids(synthesis_result)
+            if completed_paper_ids:
+                st.info(f"恢复之前生成到一半的结果，已完成 {len(completed_paper_ids)}/{len(selected_paper_objs)} 篇...")
         else:
             synthesis_result = f"# ArXiv 芯片架构前沿精选\n\n"
             synthesis_result += f"生成时间：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
@@ -429,19 +472,20 @@ def main():
         pdf_processor = PDFProcessor(PDF_DIR)
 
         for i, paper in enumerate(selected_paper_objs, 1):
-            # Skip if this paper is already done in partial result
-            done_count = synthesis_result.count("## ")
-            if i < done_count:
+            # Skip papers already completed in a previous partial run.
+            if paper.id in completed_paper_ids:
                 progress_bar.progress(i / len(selected_paper_objs))
                 continue
 
             progress = i / len(selected_paper_objs)
             status_text.text(f"正在处理第 {i}/{len(selected_paper_objs)} 篇: {paper.title[:50]}...")
             progress_bar.progress(progress)
+            paper_marker = get_paper_done_marker(paper.id)
 
             # Get full text from PDF
             full_text = pdf_processor.get_or_download(paper)
             if full_text is None:
+                synthesis_result += f"{paper_marker}\n"
                 synthesis_result += f"## {i}. {paper.title}\n\n"
                 synthesis_result += f"**作者**: {paper.authors}\n\n"
                 synthesis_result += f"评分: **{paper.ai_score}/10** 标签: {paper.ai_tags}\n\n"
@@ -449,11 +493,13 @@ def main():
                 synthesis_result += f"原文链接: {paper.pdf_url}\n\n"
                 synthesis_result += "---\n\n"
                 # Save partial result immediately after each paper
+                completed_paper_ids.add(paper.id)
                 st.session_state.partial_synthesis = synthesis_result
                 continue
 
             synthesis = synthesizer.synthesize_paper(paper, full_text)
             if synthesis is None:
+                synthesis_result += f"{paper_marker}\n"
                 synthesis_result += f"## {i}. {paper.title}\n\n"
                 synthesis_result += f"**作者**: {paper.authors}\n\n"
                 synthesis_result += f"评分: **{paper.ai_score}/10** 标签: {paper.ai_tags}\n\n"
@@ -461,9 +507,11 @@ def main():
                 synthesis_result += f"原文链接: {paper.pdf_url}\n\n"
                 synthesis_result += "---\n\n"
                 # Save partial result immediately after each paper
+                completed_paper_ids.add(paper.id)
                 st.session_state.partial_synthesis = synthesis_result
                 continue
 
+            synthesis_result += f"{paper_marker}\n"
             synthesis_result += f"## {i}. {paper.title}\n\n"
             synthesis_result += f"**作者**: {paper.authors}\n\n"
             synthesis_result += f"评分: **{paper.ai_score}/10** 标签: {paper.ai_tags}\n\n"
@@ -473,6 +521,7 @@ def main():
             synthesis_result += "\n\n---\n\n"
             # Save partial result immediately after each paper - so even if user refreshes,
             # we don't lose what's already done and can resume from where we left off
+            completed_paper_ids.add(paper.id)
             st.session_state.partial_synthesis = synthesis_result
 
         progress_bar.progress(1.0)
@@ -487,6 +536,8 @@ def main():
         st.success(f"生成完成！已保存到数据库，共处理 {len(selected_paper_objs)} 篇论文")
         # Reset generating state
         st.session_state.generating_synthesis = False
+        if 'synthesis_queue' in st.session_state:
+            del st.session_state.synthesis_queue
         # Auto-offer download immediately so it's not lost on refresh
         filename = f"arxiv-selection-{datetime.datetime.now().strftime('%Y%m%d')}.md"
         st.download_button(
@@ -584,12 +635,10 @@ def main():
                 st.write(f"📅 发表: {paper.published[:10]} | 🔗 [PDF链接]({paper.pdf_url})")
 
             with col2:
-                is_selected = paper.id in st.session_state.selected_papers
-                if st.checkbox("选择", key=f"select_{paper.id}", value=is_selected):
-                    st.session_state.selected_papers.add(paper.id)
-                else:
-                    if paper.id in st.session_state.selected_papers:
-                        st.session_state.selected_papers.remove(paper.id)
+                checkbox_key = f"select_{paper.id}"
+                if checkbox_key not in st.session_state:
+                    st.session_state[checkbox_key] = paper.id in st.session_state.selected_papers
+                st.checkbox("选择", key=checkbox_key)
                 if st.button("⭐" if not paper.is_starred else "💫", key=f"star_{paper.id}"):
                     db.toggle_starred(paper.id)
                     st.rerun()
