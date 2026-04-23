@@ -89,10 +89,10 @@ class ArXivCrawler:
             processed_at=None
         )
 
-    def sync(self, max_papers: int = None, max_workers: int = 3) -> SyncResult:
+    def sync(self, max_papers: int = None) -> SyncResult:
         """
         Synchronize papers from ArXiv to database.
-        Uses parallel fetching for faster speed.
+        Uses sequential fetching to comply with ArXiv rate limits (1 request per 3 seconds, single connection).
         Optimized: stops early when hitting many existing papers (since results are sorted by date descending).
         """
         search_query = self._build_search_query()
@@ -110,94 +110,46 @@ class ArXivCrawler:
         consecutive_existing = 0
         stop_threshold = 20  # Stop after 20 consecutive existing papers (all newer already processed)
 
-        # First pass: quickly scan to find which papers are new
-        # We just get the IDs from the search (much faster)
-        paper_ids_to_fetch = []
-
         try:
             results: Iterator[arxiv.Result] = self.client.results(search)
-            print(f"Scanning for new papers (max {max_papers})...\n")
+            print(f"Fetching papers from ArXiv (max {max_papers})...\n")
+            print("Complying with ArXiv rate limits: 1 request per 3 seconds, single connection.\n")
 
             for result in results:
+                # Convert and insert directly - process sequentially
                 paper_id = result.entry_id.split('/')[-1]
                 paper_id = re.sub(r'v\d+$', '', paper_id)
 
                 processed_count += 1
-                existing = self.db.get_paper(paper_id)
 
-                if existing is not None:
+                # Convert result to our Paper format directly - no need for second pass
+                paper = self._paper_from_result(result)
+
+                # Insert or update
+                if self.db.insert_or_update_paper(paper):
+                    papers_added += 1
+                    consecutive_existing = 0
+                else:
                     papers_updated += 1
                     consecutive_existing += 1
-                else:
-                    paper_ids_to_fetch.append(paper_id)
-                    consecutive_existing = 0
-                    # We'll fetch details in parallel
 
                 # Progress
-                if processed_count % 50 == 0:
-                    print(f"Scanned {processed_count} | Found {len(paper_ids_to_fetch)} new papers | "
+                if processed_count % 10 == 0:
+                    print(f"Processed {processed_count} | Added {papers_added} new papers | "
                           f"Consecutive existing: {consecutive_existing}")
 
                 # Early stop
-                if consecutive_existing >= stop_threshold and len(paper_ids_to_fetch) == 0:
+                if consecutive_existing >= stop_threshold and papers_added == 0:
                     print(f"\nEarly stop: {stop_threshold} consecutive existing papers and no new papers found. "
                           f"All newer papers already processed.")
                     break
 
-                # Light rate limiting during scanning
-                time.sleep(0.05)
+                # Comply with ArXiv rate limit: one request every three seconds
+                # We are already on single connection, this ensures rate compliance
+                if processed_count < max_papers:  # No need to sleep after last request
+                    time.sleep(3.0)
 
-            print(f"\nScan complete. Scanned {processed_count} papers, found {len(paper_ids_to_fetch)} new papers to fetch.")
-
-            # Second pass: parallel fetch details for new papers
-            if len(paper_ids_to_fetch) > 0:
-                print(f"Fetching {len(paper_ids_to_fetch)} new papers in parallel (max {max_workers} workers)...")
-
-                def fetch_paper(paper_id: str, max_retries: int = 3) -> Optional[Paper]:
-                    """Fetch a single paper by ID with retries on failure."""
-                    for retry in range(max_retries):
-                        try:
-                            search = arxiv.Search(id_list=[paper_id])
-                            paper_result = next(self.client.results(search))
-                            paper = self._paper_from_result(paper_result)
-                            time.sleep(1.0)  # Rate limiting per request
-                            return paper
-                        except Exception as e:
-                            if "429" in str(e):
-                                # Rate limit hit, backoff
-                                backoff = 5 * (retry + 1)
-                                print(f"  [{paper_id}] Rate limit 429, retry {retry+1}/{max_retries} after {backoff}s...")
-                                time.sleep(backoff)
-                            else:
-                                print(f"  [{paper_id}] Failed (attempt {retry+1}/{max_retries}): {e}")
-                                if retry < max_retries - 1:
-                                    time.sleep(3)
-                    print(f"  [{paper_id}] All {max_retries} retries failed, skipping.")
-                    return None
-
-                papers_added = 0
-                # Process in batches to avoid overwhelming ArXiv
-                batch_size = max_workers * 5
-                for batch_start in range(0, len(paper_ids_to_fetch), batch_size):
-                    batch_ids = paper_ids_to_fetch[batch_start:batch_start + batch_size]
-
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        futures = [executor.submit(fetch_paper, pid) for pid in batch_ids]
-                        for i, future in enumerate(as_completed(futures), 1):
-                            paper = future.result()
-                            if paper is not None:
-                                if self.db.insert_or_update_paper(paper):
-                                    papers_added += 1
-                            completed_total = batch_start + i
-                            if completed_total % 10 == 0:
-                                print(f"  Fetched {completed_total}/{len(paper_ids_to_fetch)}")
-
-                    # Pause between batches
-                    if batch_start + batch_size < len(paper_ids_to_fetch):
-                        print(f"  Pausing for 5 seconds to avoid rate limit...")
-                        time.sleep(5)
-
-            print(f"\nSync complete! Total scanned: {processed_count}, added: {papers_added}, updated: {papers_updated}")
+            print(f"\nSync complete! Total processed: {processed_count}, added: {papers_added}, updated: {papers_updated}")
             self.db.log_sync(papers_added, papers_updated, 'success')
             return SyncResult(
                 papers_added=papers_added,
