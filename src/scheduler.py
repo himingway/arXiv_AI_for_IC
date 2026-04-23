@@ -59,7 +59,6 @@ def run_scheduler():
     )
 
     print(f"Scheduler started. Will run daily sync at 08:00 Beijing time (00:00 UTC)")
-    print(f"Next run will be at: {scheduler.get_job('daily_sync').next_run_time}")
 
     # Check if we need to run on startup if not synced today
     db = Database(DB_PATH)
@@ -67,6 +66,11 @@ def run_scheduler():
     if not crawler.check_todays_sync_done():
         print("No sync today, running initial sync...")
         sync_job()
+
+    # Calculate next run time before starting
+    job = scheduler.get_job('daily_sync')
+    next_run = job.trigger.get_next_fire_time(None, datetime.datetime.now(datetime.timezone.utc))
+    print(f"Next run will be at: {next_run}")
 
     try:
         scheduler.start()
