@@ -79,7 +79,13 @@ echo
 echo "✓ Services started successfully!"
 echo
 echo "  Local URL:  http://localhost:8501"
-echo "  Network URL: http://$(hostname -I | awk '{print $1}'):8501"
+# Try to get network IP, skip if hostname command not available
+if command -v hostname >/dev/null 2>&1; then
+    NET_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -n "$NET_IP" ]; then
+        echo "  Network URL: http://$NET_IP:8501"
+    fi
+fi
 echo "  Next daily sync: Check logs for details"
 echo
 echo "  Log files:"
