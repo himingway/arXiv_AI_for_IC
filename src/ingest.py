@@ -118,8 +118,9 @@ class ArXivCrawler:
         papers_added = 0
         papers_updated = 0
         processed_count = 0
-        consecutive_existing = 0
-        stop_threshold = 20  # Stop after 20 consecutive existing papers (all newer already processed)
+        stop_threshold = 20  # Stop when the last 20 papers were all already in database
+        # Sliding window of recent existence status: True = existing (updated), False = new
+        recent = []
 
         try:
             results: Iterator[arxiv.Result] = self.client.results(search)
@@ -139,20 +140,35 @@ class ArXivCrawler:
                 # Insert or update
                 if self.db.insert_or_update_paper(paper):
                     papers_added += 1
-                    consecutive_existing = 0
+                    is_existing = False
                 else:
                     papers_updated += 1
-                    consecutive_existing += 1
+                    is_existing = True
+
+                # Update sliding window: keep only the last stop_threshold entries
+                recent.append(is_existing)
+                if len(recent) > stop_threshold:
+                    recent.pop(0)
 
                 # Progress
                 if processed_count % 10 == 0:
+                    consecutive_existing = sum(recent)
                     print(f"Processed {processed_count} | Added {papers_added} new papers | "
-                          f"Consecutive existing: {consecutive_existing}")
+                          f"Consecutive existing (last {stop_threshold}): {sum(recent)}")
 
-                # Early stop
-                if consecutive_existing >= stop_threshold and papers_added == 0:
-                    print(f"\nEarly stop: {stop_threshold} consecutive existing papers and no new papers found. "
-                          f"All newer papers already processed.")
+                # Early stop conditions (ALL must be true):
+                # 1. We have at least stop_threshold recent papers
+                # 2. All of the last stop_threshold papers are already existing in database
+                # 3. AND: We have already added at least one new paper in this sync
+                #
+                # This guarantees correctness for all scenarios:
+                # - Normal daily sync: if all newest papers already in DB, early stop (after first new found + then 20 existing)
+                # - Interrupted sync restart: if all papers so far are existing but some later are not,
+                #   papers_added = 0 so no early stop → will continue processing until max to find any missing ones
+                # - Only stop when we're sure all remaining older papers are already in database
+                if len(recent) == stop_threshold and all(recent) and papers_added > 0:
+                    print(f"\nEarly stop: after adding {papers_added} new papers, the last {stop_threshold} consecutive "
+                          f"papers are all already in database. All remaining older papers are already processed.")
                     break
 
                 # Comply with ArXiv rate limit: one request every three seconds
