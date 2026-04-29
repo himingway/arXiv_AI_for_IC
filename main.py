@@ -17,17 +17,20 @@ Usage:
 import sys
 import os
 import glob
+import logging
 from dotenv import load_dotenv
 
 from src.database import Database
 from src.ingest import run_sync
 from src.ai_filter import process_all_unprocessed
 from src.scheduler import run_scheduler
-
+from src.logging_config import setup_logging
 
 load_dotenv()
 DB_PATH = os.getenv('DB_PATH', './data/papers.db')
 PDF_DIR = os.getenv('PDF_DIR', './pdfs')
+
+logger = logging.getLogger(__name__)
 
 
 def show_stats():
@@ -74,14 +77,12 @@ def clear_database(clear_pdf: bool = False):
         print("Cancelled.")
         return
 
-    # Delete database
     try:
         os.remove(db_path)
-        print(f"✓ Deleted database: {db_path}")
+        print(f"Deleted database: {db_path}")
     except Exception as e:
         print(f"Error deleting database: {e}")
 
-    # Delete PDFs if requested
     if clear_pdf and os.path.exists(pdf_dir):
         pdf_files = glob.glob(os.path.join(pdf_dir, '*.pdf'))
         deleted = 0
@@ -91,25 +92,23 @@ def clear_database(clear_pdf: bool = False):
                 deleted += 1
             except Exception:
                 pass
-        print(f"✓ Deleted {deleted} PDF files from {pdf_dir}")
+        print(f"Deleted {deleted} PDF files from {pdf_dir}")
 
     print("\nDone. Next sync will create a fresh database.")
 
 
 def debug_config():
     """Debug: print current configuration."""
-    import os
     from pathlib import Path
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv as _load
 
-    # Load .env
     project_root = Path(__file__).parent
     env_path = project_root / '.env'
     print(f"Loading .env from: {env_path}")
     print(f"File exists: {env_path.exists()}")
 
     if env_path.exists():
-        load_dotenv(env_path)
+        _load(env_path)
 
     print("\n=== Current Configuration ===")
     print(f"LLM_PROVIDER: {os.getenv('LLM_PROVIDER')}")
@@ -117,14 +116,13 @@ def debug_config():
     print(f"ANTHROPIC_BASE_URL: {os.getenv('ANTHROPIC_BASE_URL')}")
     api_key = os.getenv('API_KEY', '')
     if api_key:
-        # Show only first 8 and last 4 chars for safety
         if len(api_key) > 12:
             masked = api_key[:8] + '*' * (len(api_key) - 12) + api_key[-4:]
         else:
             masked = '*' * len(api_key)
         print(f"API_KEY: {masked} (length: {len(api_key)})")
     else:
-        print(f"API_KEY: <empty>")
+        print("API_KEY: <empty>")
     print(f"LLM_MODEL: {os.getenv('LLM_MODEL')}")
     print(f"TEMPERATURE: {os.getenv('TEMPERATURE')}")
     print(f"MAX_TOKENS_SCORING: {os.getenv('MAX_TOKENS_SCORING')}")
@@ -135,6 +133,8 @@ def debug_config():
 
 
 def main():
+    setup_logging()
+
     if len(sys.argv) < 2:
         print(__doc__)
         return
@@ -142,13 +142,13 @@ def main():
     cmd = sys.argv[1]
 
     if cmd == 'sync':
-        # Check if max results given in args
         max_results = None
         if len(sys.argv) >= 3:
             try:
                 max_results = int(sys.argv[2])
             except ValueError:
                 pass
+        logger.info(f"Starting sync from ArXiv... max_results={max_results or '(default 100)'}")
         print(f"Starting sync from ArXiv... max_results={max_results or '(default 100)'}")
         result = run_sync(DB_PATH, max_results=max_results)
         if result.success:
@@ -157,6 +157,7 @@ def main():
             print(f"Sync failed: {result.error_message}")
 
     elif cmd == 'process':
+        logger.info("Processing unprocessed papers with AI...")
         print("Processing unprocessed papers with AI...")
         db = Database(DB_PATH)
         total = process_all_unprocessed(db, batch_size=10, delay=2.0)

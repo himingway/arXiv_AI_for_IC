@@ -6,10 +6,10 @@ import os
 import re
 import sys
 import datetime
+import logging
 import streamlit as st
 from dotenv import load_dotenv
 
-# Add src to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.database import Database, Paper
@@ -17,16 +17,19 @@ from src.ingest import ArXivCrawler, SyncResult
 from src.ai_filter import AIFilter
 from src.pdf_parser import PDFProcessor
 from src.deep_synthesis import DeepSynthesizer
+from src.logging_config import setup_logging
 
+setup_logging()
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Configuration
 DB_PATH = os.getenv('DB_PATH', './data/papers.db')
 PDF_DIR = os.getenv('PDF_DIR', './pdfs')
 MIN_SCORE_DEFAULT = 7
 PAPER_DONE_MARKER_PREFIX = "<!-- PAPER_DONE:"
 PAPER_DONE_MARKER_SUFFIX = " -->"
+PAGE_SIZE = 50
 
 
 def init_session_state():
@@ -45,6 +48,8 @@ def init_session_state():
         st.session_state.generating_synthesis = False
     if 'saved_synthesis_paper_ids' not in st.session_state:
         st.session_state.saved_synthesis_paper_ids = set()
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = 1
 
 
 def get_db():
@@ -55,19 +60,17 @@ def get_db():
 
 
 def format_authors(authors: str, max_len: int = 45) -> str:
-    """Format authors for display - shorter to fit metadata in one line."""
+    """Format authors for display."""
     if len(authors) <= max_len:
         return authors
     return authors[:max_len] + "..."
 
 
 def get_paper_done_marker(paper_id: str) -> str:
-    """Create an invisible marker so resume logic can count completed papers exactly."""
     return f"{PAPER_DONE_MARKER_PREFIX}{paper_id}{PAPER_DONE_MARKER_SUFFIX}"
 
 
 def get_completed_paper_ids(content: str) -> set[str]:
-    """Extract completed paper IDs from the persisted partial synthesis."""
     completed_paper_ids = set()
     for line in content.splitlines():
         if line.startswith(PAPER_DONE_MARKER_PREFIX) and line.endswith(PAPER_DONE_MARKER_SUFFIX):
@@ -76,7 +79,6 @@ def get_completed_paper_ids(content: str) -> set[str]:
 
 
 def normalize_synthesis_entry(entry: str) -> str:
-    """Normalize a single synthesis entry for standalone display."""
     normalized_entry = entry.strip()
     while normalized_entry.endswith("---"):
         normalized_entry = normalized_entry[:-3].rstrip()
@@ -88,7 +90,6 @@ def normalize_synthesis_entry(entry: str) -> str:
 
 
 def parse_synthesis_entries(content: str) -> list[str]:
-    """Parse stored synthesis content into standalone per-paper entries."""
     if not content:
         return []
 
@@ -129,7 +130,6 @@ def parse_synthesis_entries(content: str) -> list[str]:
 
 
 def get_synthesis_entry_title(entry: str) -> str:
-    """Extract the paper title from a single synthesis entry."""
     first_line = entry.strip().splitlines()[0] if entry.strip() else ""
     if first_line.startswith("## "):
         return first_line[3:].strip()
@@ -137,7 +137,6 @@ def get_synthesis_entry_title(entry: str) -> str:
 
 
 def build_synthesis_entry(paper: Paper, body: str, include_arxiv_link: bool = False) -> str:
-    """Build the markdown entry for a single paper."""
     entry = f"## {paper.title}\n\n"
     entry += f"**作者**: {paper.authors}\n\n"
     entry += f"评分: **{paper.ai_score}/10** 标签: {paper.ai_tags}\n\n"
@@ -151,7 +150,6 @@ def build_synthesis_entry(paper: Paper, body: str, include_arxiv_link: bool = Fa
 
 
 def get_selected_paper_ids_in_order(papers: list[Paper]) -> list[str]:
-    """Sync checkbox widget state into session state and return a stable paper order."""
     visible_paper_ids = {paper.id for paper in papers}
     ordered_selected_ids = []
 
@@ -180,10 +178,8 @@ def main():
         initial_sidebar_state="expanded"
     )
 
-    # Custom CSS for better styling
     st.markdown("""
     <style>
-    /* Improve container spacing - paper card styling */
     .stContainer {
         padding-top: 0.8rem;
         padding-bottom: 0.8rem;
@@ -193,23 +189,14 @@ def main():
         background-color: rgba(255, 255, 255, 0.02);
         transition: all 0.2s;
     }
-
     .stContainer:hover {
         border-color: #9ca3af;
         background-color: rgba(255, 255, 255, 0.04);
     }
-
-    /* Dark mode support */
     @media (prefers-color-scheme: dark) {
-        .stContainer {
-            border-color: #374151;
-        }
-        .stContainer:hover {
-            border-color: #6b7280;
-        }
+        .stContainer { border-color: #374151; }
+        .stContainer:hover { border-color: #6b7280; }
     }
-
-    /* Tag pills */
     .tag-pill {
         display: inline-block;
         background: rgba(99, 102, 241, 0.12);
@@ -222,8 +209,6 @@ def main():
         margin: 0 2px;
         vertical-align: middle;
     }
-
-    /* Score badges */
     .score-badge {
         display: inline-block;
         border-radius: 100px;
@@ -238,8 +223,6 @@ def main():
     .score-s5  { background: rgba(234,179,8,0.18);  color: #fde047; border: 1px solid rgba(234,179,8,0.35); }
     .score-low { background: rgba(99,102,241,0.14); color: #a5b4fc; border: 1px solid rgba(99,102,241,0.3); }
     .score-na  { background: rgba(156,163,175,0.14); color: #9ca3af; border: 1px solid rgba(156,163,175,0.3); }
-
-    /* Metadata row */
     .meta-row {
         display: flex;
         align-items: center;
@@ -249,13 +232,8 @@ def main():
         font-size: 0.85rem;
         line-height: 1.6;
     }
-    .meta-authors {
-        color: #9ca3af;
-        font-size: 0.82rem;
-    }
+    .meta-authors { color: #9ca3af; font-size: 0.82rem; }
     .meta-sep { color: #4b5563; font-size: 0.9rem; }
-
-    /* Action column: stack checkbox + star button tightly (scoped to paper cards only) */
     .stContainer [data-testid="column"]:last-child {
         display: flex;
         flex-direction: column;
@@ -270,23 +248,9 @@ def main():
         min-width: 2.4rem;
         font-size: 1rem;
     }
-
-    /* Improve heading spacing */
-    h1 {
-        margin-bottom: 1.5rem;
-    }
-
-    h3 {
-        margin-top: 0.1rem !important;
-        margin-bottom: 0.5rem !important;
-    }
-
-    /* Improve divider spacing */
-    hr {
-        margin: 1.5rem 0;
-    }
-
-    /* Remove problematic global button CSS that squishes everything */
+    h1 { margin-bottom: 1.5rem; }
+    h3 { margin-top: 0.1rem !important; margin-bottom: 0.5rem !important; }
+    hr { margin: 1.5rem 0; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -303,10 +267,8 @@ def main():
 
         st.divider()
 
-        # Stats
         stats = db.get_stats()
         st.subheader("📊 统计信息")
-        # Use metric cards for better visual appeal
         col_stat1, col_stat2 = st.columns(2)
         with col_stat1:
             st.metric("总论文数", stats['total_papers'])
@@ -320,7 +282,6 @@ def main():
 
         st.divider()
 
-        # Manual sync button
         st.subheader("🔄 数据同步")
         crawler = ArXivCrawler(db)
         synced_today = crawler.check_todays_sync_done()
@@ -365,7 +326,6 @@ def main():
 
         st.divider()
 
-        # AI processing
         st.subheader("🤖 AI 评分")
         pending = db.count_unprocessed()
         st.caption(f"待处理: {pending} 篇")
@@ -393,7 +353,6 @@ def main():
 
         st.divider()
 
-        # PDF storage info
         pdf_stats = pdf_processor.get_storage_stats()
         st.subheader("📄 PDF 存储")
         st.caption(f"已下载: {pdf_stats['file_count']} 个文件")
@@ -401,14 +360,12 @@ def main():
 
         st.divider()
 
-        # Saved syntheses history
         st.subheader("📜 历史生成记录")
         synth_count = db.count_syntheses()
         if synth_count > 0:
             st.caption(f"共保存了 {synth_count} 条记录")
             recent = db.get_recent_syntheses(limit=50)
-            
-            # Map ID to summary
+
             synth_options = {}
             for synth in recent:
                 paper_ids = synth['paper_ids'] or []
@@ -425,12 +382,12 @@ def main():
                 synth_options[synth['id']] = summary_text
 
             selected_synth_id = st.selectbox(
-                "选择历史记录", 
-                options=list(synth_options.keys()), 
+                "选择历史记录",
+                options=list(synth_options.keys()),
                 format_func=lambda x: synth_options[x],
                 label_visibility="collapsed"
             )
-            
+
             if selected_synth_id:
                 selected_synth = next((s for s in recent if s['id'] == selected_synth_id), None)
                 if selected_synth:
@@ -460,7 +417,7 @@ def main():
     # Main content
     st.title("📚 ArXiv 芯片架构与 EDA 前沿论文")
 
-    # Filters - better balanced proportions
+    # Filters
     st.subheader("🔍 筛选条件")
     col1, col2, col3, col4 = st.columns([1.2, 1.5, 1.2, 2.1], vertical_alignment="center")
     with col1:
@@ -472,47 +429,85 @@ def main():
     with col4:
         search_query = st.text_input("搜索标题/作者/标签", placeholder="输入关键词搜索...")
 
-    # Build filter parameters
     min_score = 7 if filter_high_score else None
     only_today = filter_today
     only_starred = filter_starred
     search = search_query if search_query else None
 
-    # Get filtered papers
     total_filtered = db.count_filtered(
         only_today=only_today,
         min_score=min_score,
         only_starred=only_starred,
         search=search
     )
+
+    # Pagination
+    total_pages = max(1, (total_filtered + PAGE_SIZE - 1) // PAGE_SIZE)
+    current_page = st.session_state.current_page
+    if current_page > total_pages:
+        current_page = total_pages
+        st.session_state.current_page = current_page
+
+    offset = (current_page - 1) * PAGE_SIZE
     papers = db.get_filtered_papers(
         only_today=only_today,
         min_score=min_score,
         only_starred=only_starred,
         search=search,
-        limit=100
+        limit=PAGE_SIZE,
+        offset=offset
     )
 
-    st.write(f"**找到 {total_filtered} 篇论文**，显示前 100 篇")
+    # Page info and navigation
+    page_col1, page_col2, page_col3 = st.columns([2, 3, 2], vertical_alignment="center")
+    with page_col1:
+        st.markdown(f"**找到 {total_filtered} 篇论文**，第 {current_page}/{total_pages} 页")
+    with page_col2:
+        nav_cols = st.columns(min(total_pages, 7), gap="small")
+        # Previous page
+        with nav_cols[0]:
+            if st.button("◀ 上一页", disabled=current_page <= 1, use_container_width=True):
+                st.session_state.current_page = current_page - 1
+                st.rerun()
+        # Page numbers (show up to 5 pages)
+        if total_pages > 1:
+            start_page = max(1, current_page - 2)
+            end_page = min(total_pages + 1, start_page + 6)
+            start_page = max(1, end_page - 6)
+            for idx, page_num in enumerate(range(start_page, min(end_page, total_pages + 1)), 1):
+                if idx < len(nav_cols) - 1:
+                    with nav_cols[idx]:
+                        is_current = page_num == current_page
+                        if st.button(
+                            f"{'📄 ' if is_current else ''}{page_num}",
+                            disabled=is_current,
+                            use_container_width=True,
+                        ):
+                            st.session_state.current_page = page_num
+                            st.rerun()
+        # Next page
+        with nav_cols[-1]:
+            if st.button("下一页 ▶", disabled=current_page >= total_pages, use_container_width=True):
+                st.session_state.current_page = current_page + 1
+                st.rerun()
 
-    # Pre-fetch all recent syntheses once to avoid N+1 queries inside the paper loop
+    # Pre-fetch syntheses
     _recent_synths = db.get_recent_syntheses(limit=20) if db.count_syntheses() > 0 else []
     synth_by_paper: dict = {}
     for _s in _recent_synths:
         for _pid in _s['paper_ids']:
             synth_by_paper.setdefault(_pid, []).append(_s)
 
-    if not papers:
+    if not papers and total_filtered == 0:
         st.info("没有找到符合条件的论文。请先点击侧边栏的「立即同步最新论文」获取数据。")
         return
 
-    # Display papers in a table-like format with checkboxes
     st.divider()
 
-    # Action bar for selected papers - TOP so you don't need to scroll to bottom
+    # Action bar
     selected_paper_ids = get_selected_paper_ids_in_order(papers)
     selected_count = len(selected_paper_ids)
-    col_a, col_b = st.columns([3, 1], vertical_alignment="center")
+    col_a, col_b, col_c = st.columns([3, 1, 1], vertical_alignment="center")
     with col_a:
         st.markdown(f"##### 已选择 **{selected_count}** 篇论文")
     with col_b:
@@ -528,12 +523,19 @@ def main():
                 st.rerun()
         elif st.session_state.generating_synthesis:
             st.button("📝 正在生成中...", disabled=True, use_container_width=True)
+    with col_c:
+        if st.session_state.generating_synthesis:
+            if st.button("❌ 取消生成", use_container_width=True):
+                st.session_state.generating_synthesis = False
+                if 'synthesis_queue' in st.session_state:
+                    del st.session_state.synthesis_queue
+                st.session_state.saved_synthesis_paper_ids = set()
+                st.rerun()
 
-    # Show warning once
     if st.session_state.generating_synthesis:
         st.warning("⚠️ 生成过程中请勿刷新或重复点击，刷新会中断生成，但是已完成内容会保存可断点续传。")
 
-    # Actual generation runs when generating_synthesis is True - TOP so you see progress/result immediately
+    # Synthesis generation with error recovery
     if st.session_state.generating_synthesis:
         queued_paper_ids = st.session_state.get('synthesis_queue') or selected_paper_ids
         selected_paper_objs = [p for pid in queued_paper_ids if (p := db.get_paper(pid))]
@@ -542,7 +544,7 @@ def main():
         completed_paper_ids = set()
         saved_paper_ids = set(st.session_state.saved_synthesis_paper_ids)
         synthesis_entries = []
-        # Resume from partial result in session if we have it (interrupted by refresh)
+
         if 'partial_synthesis' in st.session_state:
             synthesis_result = st.session_state.partial_synthesis
             completed_paper_ids = get_completed_paper_ids(synthesis_result)
@@ -559,71 +561,76 @@ def main():
         synthesizer = DeepSynthesizer()
         pdf_processor = PDFProcessor(PDF_DIR)
 
-        for i, paper in enumerate(selected_paper_objs, 1):
-            # Skip papers already completed in a previous partial run.
-            if paper.id in completed_paper_ids:
-                progress_bar.progress(i / len(selected_paper_objs))
-                continue
+        try:
+            for i, paper in enumerate(selected_paper_objs, 1):
+                if paper.id in completed_paper_ids:
+                    progress_bar.progress(i / len(selected_paper_objs))
+                    continue
 
-            progress = i / len(selected_paper_objs)
-            status_text.text(f"正在处理第 {i}/{len(selected_paper_objs)} 篇: {paper.title[:50]}...")
-            progress_bar.progress(progress)
-            paper_marker = get_paper_done_marker(paper.id)
-            entry_body = ""
-            include_arxiv_link = False
+                progress = i / len(selected_paper_objs)
+                status_text.text(f"正在处理第 {i}/{len(selected_paper_objs)} 篇: {paper.title[:50]}...")
+                progress_bar.progress(progress)
+                paper_marker = get_paper_done_marker(paper.id)
+                entry_body = ""
+                include_arxiv_link = False
 
-            # Get full text from PDF
-            full_text = pdf_processor.get_or_download(paper)
-            if full_text is None:
-                entry_body = "PDF 下载失败，无法生成深度分析。"
-            else:
-                synthesis = synthesizer.synthesize_paper(paper, full_text)
-                if synthesis is None:
-                    entry_body = "AI 生成失败。"
+                full_text = pdf_processor.get_or_download(paper)
+                if full_text is None:
+                    entry_body = "PDF 下载失败，无法生成深度分析。"
                 else:
-                    entry_body = synthesis
-                    include_arxiv_link = True
+                    synthesis = synthesizer.synthesize_paper(paper, full_text)
+                    if synthesis is None:
+                        entry_body = "AI 生成失败。"
+                    else:
+                        entry_body = synthesis
+                        include_arxiv_link = True
 
-            entry_content = build_synthesis_entry(
-                paper,
-                entry_body,
-                include_arxiv_link=include_arxiv_link,
+                entry_content = build_synthesis_entry(
+                    paper,
+                    entry_body,
+                    include_arxiv_link=include_arxiv_link,
+                )
+
+                db.save_synthesis([paper.id], entry_content)
+                saved_paper_ids.add(paper.id)
+                st.session_state.saved_synthesis_paper_ids = saved_paper_ids
+
+                synthesis_result += f"{paper_marker}\n"
+                synthesis_result += entry_content
+                synthesis_result += "\n\n---\n\n"
+                synthesis_entries.append(entry_content)
+                completed_paper_ids.add(paper.id)
+                st.session_state.partial_synthesis = synthesis_result
+
+            progress_bar.progress(1.0)
+            status_text.empty()
+            st.session_state.synthesis_result = synthesis_result
+            st.session_state.synthesis_entries = synthesis_entries
+            if 'partial_synthesis' in st.session_state:
+                del st.session_state.partial_synthesis
+            st.success(f"生成完成！已逐篇保存到数据库，共处理 {len(selected_paper_objs)} 篇论文")
+            st.session_state.generating_synthesis = False
+            if 'synthesis_queue' in st.session_state:
+                del st.session_state.synthesis_queue
+            st.session_state.saved_synthesis_paper_ids = set()
+            filename = f"arxiv-selection-{datetime.datetime.now().strftime('%Y%m%d')}.md"
+            st.download_button(
+                label="⬇️ 立即下载 Markdown",
+                data=synthesis_result,
+                file_name=filename,
+                mime="text/markdown"
             )
 
-            db.save_synthesis([paper.id], entry_content)
-            saved_paper_ids.add(paper.id)
-            st.session_state.saved_synthesis_paper_ids = saved_paper_ids
+        except Exception as e:
+            logger.error(f"Synthesis generation error: {e}", exc_info=True)
+            st.error(f"生成过程中出错: {e}")
+            st.warning("已保存当前进度，点击「生成深度推文」可从断点继续。")
+            st.session_state.generating_synthesis = False
+            if 'synthesis_queue' in st.session_state:
+                del st.session_state.synthesis_queue
+            st.session_state.saved_synthesis_paper_ids = set()
 
-            synthesis_result += f"{paper_marker}\n"
-            synthesis_result += entry_content
-            synthesis_result += "\n\n---\n\n"
-            synthesis_entries.append(entry_content)
-            completed_paper_ids.add(paper.id)
-            st.session_state.partial_synthesis = synthesis_result
-
-        progress_bar.progress(1.0)
-        status_text.empty()
-        st.session_state.synthesis_result = synthesis_result
-        st.session_state.synthesis_entries = synthesis_entries
-        # Clear partial result
-        if 'partial_synthesis' in st.session_state:
-            del st.session_state.partial_synthesis
-        st.success(f"生成完成！已逐篇保存到数据库，共处理 {len(selected_paper_objs)} 篇论文")
-        # Reset generating state
-        st.session_state.generating_synthesis = False
-        if 'synthesis_queue' in st.session_state:
-            del st.session_state.synthesis_queue
-        st.session_state.saved_synthesis_paper_ids = set()
-        # Auto-offer download immediately so it's not lost on refresh
-        filename = f"arxiv-selection-{datetime.datetime.now().strftime('%Y%m%d')}.md"
-        st.download_button(
-            label="⬇️ 立即下载 Markdown",
-            data=synthesis_result,
-            file_name=filename,
-            mime="text/markdown"
-        )
-
-    # Display existing synthesis results as separate entries.
+    # Display synthesis results
     if st.session_state.synthesis_entries:
         st.subheader("📄 生成的深度推文")
         for index, entry in enumerate(st.session_state.synthesis_entries, 1):
@@ -660,7 +667,6 @@ def main():
     st.divider()
     for paper in papers:
         with st.container():
-            # Pre-fetched synth_by_paper mapping is built outside this loop (see above)
             col1, col2 = st.columns([20, 1], vertical_alignment="center")
 
             with col1:
@@ -668,7 +674,6 @@ def main():
                 title_line = f"{star_icon}[{paper.id}] {paper.title}"
                 st.markdown(f"### {title_line}")
 
-                # Score badge HTML
                 if paper.ai_score is None:
                     score_html = '<span class="score-badge score-na">未评分</span>'
                 elif paper.ai_score >= 9:
@@ -680,14 +685,12 @@ def main():
                 else:
                     score_html = f'<span class="score-badge score-low">{paper.ai_score}/10</span>'
 
-                # Tag pills
                 if paper.ai_tags:
                     raw_tags = [t.strip() for t in paper.ai_tags.split(',') if t.strip()][:4]
                 else:
                     raw_tags = [t.strip() for t in paper.categories.split() if t.strip()][:3]
                 tags_html = ''.join(f'<span class="tag-pill">{t}</span>' for t in raw_tags)
 
-                # Metadata row
                 meta_html = (
                     f'<div class="meta-row">'
                     f'<span class="meta-authors">✍️ {format_authors(paper.authors)}</span>'
@@ -699,11 +702,9 @@ def main():
                 )
                 st.markdown(meta_html, unsafe_allow_html=True)
 
-                # Check if this paper is in any saved synthesis
                 found = synth_by_paper.get(paper.id, [])
                 has_saved = bool(found)
 
-                # Build expanders
                 if paper.ai_reason or has_saved:
                     with st.expander("💡 AI 推荐理由" + (" / 📜 已生成推文" if has_saved else ""), expanded=False):
                         if paper.ai_reason:
@@ -737,7 +738,6 @@ def main():
                 if st.button("⭐" if not paper.is_starred else "💫", key=f"star_{paper.id}"):
                     db.toggle_starred(paper.id)
                     st.rerun()
-
 
 
 if __name__ == "__main__":

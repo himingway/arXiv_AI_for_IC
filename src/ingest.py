@@ -6,11 +6,10 @@ Supports parallel fetching for faster speed.
 
 import os
 import re
+import logging
 import arxiv
 import datetime
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Iterator, Optional
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +17,8 @@ from dotenv import load_dotenv
 
 from .database import Paper
 from .database import Database
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables from project root
 project_root = Path(__file__).parent.parent
@@ -124,20 +125,16 @@ class ArXivCrawler:
 
         try:
             results: Iterator[arxiv.Result] = self.client.results(search)
-            print(f"Fetching papers from ArXiv (max {max_papers})...\n")
-            print("Complying with ArXiv rate limits: 1 request per 3 seconds, single connection.\n")
+            logger.info(f"Fetching papers from ArXiv (max {max_papers})...")
+            logger.info("ArXiv rate limit handled by client (delay_seconds=3 between page requests)")
 
             for result in results:
-                # Convert and insert directly - process sequentially
                 paper_id = result.entry_id.split('/')[-1]
                 paper_id = re.sub(r'v\d+$', '', paper_id)
 
                 processed_count += 1
-
-                # Convert result to our Paper format directly - no need for second pass
                 paper = self._paper_from_result(result)
 
-                # Insert or update
                 if self.db.insert_or_update_paper(paper):
                     papers_added += 1
                     is_existing = False
@@ -145,38 +142,20 @@ class ArXivCrawler:
                     papers_updated += 1
                     is_existing = True
 
-                # Update sliding window: keep only the last stop_threshold entries
                 recent.append(is_existing)
                 if len(recent) > stop_threshold:
                     recent.pop(0)
 
-                # Progress
                 if processed_count % 10 == 0:
-                    consecutive_existing = sum(recent)
-                    print(f"Processed {processed_count} | Added {papers_added} new papers | "
-                          f"Consecutive existing (last {stop_threshold}): {sum(recent)}")
+                    logger.info(f"Processed {processed_count} | Added {papers_added} new papers | "
+                                f"Consecutive existing (last {stop_threshold}): {sum(recent)}")
 
-                # Early stop conditions (ALL must be true):
-                # 1. We have at least stop_threshold recent papers
-                # 2. All of the last stop_threshold papers are already existing in database
-                # 3. AND: We have already added at least one new paper in this sync
-                #
-                # This guarantees correctness for all scenarios:
-                # - Normal daily sync: if all newest papers already in DB, early stop (after first new found + then 20 existing)
-                # - Interrupted sync restart: if all papers so far are existing but some later are not,
-                #   papers_added = 0 so no early stop → will continue processing until max to find any missing ones
-                # - Only stop when we're sure all remaining older papers are already in database
                 if len(recent) == stop_threshold and all(recent) and papers_added > 0:
-                    print(f"\nEarly stop: after adding {papers_added} new papers, the last {stop_threshold} consecutive "
-                          f"papers are all already in database. All remaining older papers are already processed.")
+                    logger.info(f"Early stop: after adding {papers_added} new papers, the last {stop_threshold} consecutive "
+                                f"papers are all already in database.")
                     break
 
-                # Comply with ArXiv rate limit: one request every three seconds
-                # We are already on single connection, this ensures rate compliance
-                if processed_count < max_papers:  # No need to sleep after last request
-                    time.sleep(3.0)
-
-            print(f"\nSync complete! Total processed: {processed_count}, added: {papers_added}, updated: {papers_updated}")
+            logger.info(f"Sync complete! Total processed: {processed_count}, added: {papers_added}, updated: {papers_updated}")
             self.db.log_sync(papers_added, papers_updated, 'success')
             return SyncResult(
                 papers_added=papers_added,
@@ -186,6 +165,7 @@ class ArXivCrawler:
 
         except Exception as e:
             error_msg = str(e)
+            logger.error(f"Sync failed: {error_msg}")
             self.db.log_sync(papers_added, papers_updated, 'error', error_msg)
             return SyncResult(
                 papers_added=papers_added,

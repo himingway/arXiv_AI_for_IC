@@ -1,20 +1,20 @@
 """
 AI Filtering module for paper scoring and tagging.
 Uses LLM to evaluate papers based on chip architecture and EDA relevance.
-Supports both OpenAI-compatible APIs and Anthropic Claude API.
 """
 
 import os
 import json
 import time
+import logging
 from typing import Tuple, Optional, Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
-from openai import OpenAI
-import anthropic
 
 from .database import Database, Paper
+from .llm_client import create_llm_client
 
+logger = logging.getLogger(__name__)
 
 # Load environment variables from project root
 project_root = Path(__file__).parent.parent
@@ -22,9 +22,7 @@ load_dotenv(project_root / '.env')
 
 
 class AIFilter:
-    """AI-based paper filter and scorer.
-    Supports both OpenAI-compatible APIs and Anthropic Claude API.
-    """
+    """AI-based paper filter and scorer."""
 
     SYSTEM_PROMPT = """你是一位资深的 SoC 互联架构专家。你需要评估 ArXiv 论文与"SoC 芯片互联架构"领域的相关性，并给出 1-10 分的评分：
 
@@ -58,32 +56,11 @@ class AIFilter:
 请按照要求给出评分、理由和标签："""
 
     def __init__(self):
-        self.provider = os.getenv('LLM_PROVIDER', 'openai').lower()
-        self.api_key = os.getenv('API_KEY', '')
-        self.model = os.getenv('LLM_MODEL', 'gpt-4o')
-        self.temperature = float(os.getenv('TEMPERATURE', '0.1'))
+        timeout = float(os.getenv('TIMEOUT_SCORING', '120'))
+        self.provider, self.client, self.model, self.temperature, self.api_key = create_llm_client(timeout)
         self.max_tokens = int(os.getenv('MAX_TOKENS_SCORING', '2000'))
-        self.timeout = float(os.getenv('TIMEOUT_SCORING', '120'))  # 2 minutes timeout for scoring
-
-        if self.provider == 'openai':
-            self.base_url = os.getenv('BASE_URL', 'https://api.openai.com/v1')
-            self.client = OpenAI(
-                base_url=self.base_url,
-                api_key=self.api_key,
-                timeout=self.timeout
-            )
-        elif self.provider == 'anthropic':
-            self.base_url = os.getenv('ANTHROPIC_BASE_URL', 'https://api.anthropic.com')
-            self.client = anthropic.Anthropic(
-                base_url=self.base_url,
-                api_key=self.api_key,
-                timeout=self.timeout
-            )
-        else:
-            raise ValueError(f"Unsupported LLM provider: {self.provider}. Use 'openai' or 'anthropic'.")
 
     def is_configured(self) -> bool:
-        """Check if API key is configured."""
         return bool(self.api_key and self.api_key != 'your_api_key_here')
 
     def analyze_paper(self, paper: Paper) -> Tuple[Optional[int], Optional[str], Optional[str]]:
@@ -127,27 +104,25 @@ class AIFilter:
             reason = result.get('reason', '')
             tags = result.get('tags', '')
 
-            # Clamp score to 1-10
             score = max(1, min(10, score))
 
             return score, reason, tags
 
         except Exception as e:
-            print(f"Error analyzing paper {paper.id}: {e}")
+            logger.error(f"Error analyzing paper {paper.id}: {e}")
             return None, None, None
 
     def process_next_batch(self, db: Database, batch_size: int = 10, delay_seconds: float = 2.0) -> int:
         """Process next batch of unprocessed papers. Returns number processed successfully."""
         if not self.is_configured():
-            print("API key not configured. Cannot process papers.")
+            logger.warning("API key not configured. Cannot process papers.")
             return 0
 
-        # Fetch only as many papers as needed to avoid full table scan on each call
         unprocessed = db.get_unprocessed_papers(limit=batch_size)
         processed = 0
 
         for i, paper in enumerate(unprocessed):
-            print(f"Processing {i+1}/{len(unprocessed)}: {paper.title[:60]}...")
+            logger.info(f"Processing {i+1}/{len(unprocessed)}: {paper.title[:60]}...")
             score, reason, tags = self.analyze_paper(paper)
 
             if score is not None:
@@ -160,7 +135,6 @@ class AIFilter:
         return processed
 
     def get_processing_stats(self, db: Database) -> Dict[str, Any]:
-        """Get AI processing statistics."""
         stats = db.get_stats()
         return {
             'total': stats['total_papers'],
@@ -180,12 +154,11 @@ def process_all_unprocessed(db: Database, batch_size: int = 10, delay: float = 2
         if pending == 0:
             break
 
-        print(f"Processing batch, {pending} papers remaining...")
+        logger.info(f"Processing batch, {pending} papers remaining...")
         processed = ai_filter.process_next_batch(db, batch_size=min(batch_size, pending), delay_seconds=delay)
         total_processed += processed
 
         if processed == 0:
-            # No progress made, likely API issue
             break
 
     return total_processed

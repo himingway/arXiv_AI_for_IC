@@ -6,16 +6,19 @@ Handles SQLite operations for storing paper metadata and AI analysis results.
 import os
 import sqlite3
 import datetime
+import logging
+import threading
 from contextlib import contextmanager
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
-import json
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class Paper:
     """Represents an ArXiv paper with metadata and AI analysis."""
-    id: str  # ArXiv ID
+    id: str
     title: str
     authors: str
     abstract: str
@@ -79,32 +82,41 @@ class Database:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._local = threading.local()
+        # Ensure parent directory exists once at init
+        db_dir = os.path.dirname(db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        # Ensure parent directory exists
-        db_dir = os.path.dirname(self.db_path)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        """Get a thread-local connection (one per thread, reused across calls)."""
+        conn = getattr(self._local, 'conn', None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._local.conn = conn
         return conn
+
+    def _close_connection(self):
+        """Close the thread-local connection if it exists."""
+        conn = getattr(self._local, 'conn', None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     @contextmanager
     def _connect(self):
-        """Context manager that yields a connection and guarantees close."""
-        conn = self._get_connection()
-        try:
-            yield conn
-        finally:
-            conn.close()
+        """Context manager that yields the thread-local connection."""
+        yield self._get_connection()
 
     def _init_db(self):
-        """Create tables if they don't exist."""
+        """Create tables and indexes if they don't exist."""
         with self._connect() as conn:
             cursor = conn.cursor()
 
-            # Main papers table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS papers (
                     id TEXT PRIMARY KEY,
@@ -126,7 +138,6 @@ class Database:
                 )
             ''')
 
-            # Sync tracking table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS sync_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,7 +149,6 @@ class Database:
                 )
             ''')
 
-            # Generated syntheses table (store generated deep articles)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS syntheses (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,7 +158,15 @@ class Database:
                 )
             ''')
 
+            # Indexes for common query patterns
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_papers_ai_processed ON papers(ai_processed)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_papers_ai_score ON papers(ai_score DESC)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_papers_created_at ON papers(created_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_papers_is_starred ON papers(is_starred)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_papers_published ON papers(published)')
+
             conn.commit()
+            logger.debug("Database initialized with indexes")
 
     def insert_or_update_paper(self, paper: Paper) -> bool:
         """Insert a new paper or update existing one. Returns True if inserted as new."""
@@ -157,7 +175,6 @@ class Database:
 
         with self._connect() as conn:
             cursor = conn.cursor()
-            # Use INSERT OR IGNORE to avoid TOCTOU race in parallel ingestion
             cursor.execute('''
                 INSERT OR IGNORE INTO papers (
                     id, title, authors, abstract, categories, published, updated,
@@ -172,7 +189,6 @@ class Database:
             ))
             is_new = cursor.rowcount > 0
             if not is_new:
-                # Update existing paper but preserve AI data and starred status
                 cursor.execute('''
                     UPDATE papers
                     SET title = ?, authors = ?, abstract = ?, categories = ?,
@@ -268,7 +284,7 @@ class Database:
 
         if only_today:
             today = datetime.datetime.now().date().isoformat()
-            conditions.append("DATE(created_at) = DATE(?)")
+            conditions.append("DATE(created_at) = ?")
             params.append(today)
 
         if min_score is not None:
@@ -307,7 +323,7 @@ class Database:
 
         if only_today:
             today = datetime.datetime.now().date().isoformat()
-            conditions.append("DATE(created_at) = DATE(?)")
+            conditions.append("DATE(created_at) = ?")
             params.append(today)
 
         if min_score is not None:
@@ -376,8 +392,8 @@ class Database:
             cursor.execute('SELECT COUNT(*) FROM papers WHERE is_starred = 1')
             starred = cursor.fetchone()[0]
 
-            cursor.execute('SELECT COUNT(*) FROM papers WHERE DATE(created_at) = DATE(?)',
-                           (datetime.datetime.now().isoformat(),))
+            today = datetime.datetime.now().date().isoformat()
+            cursor.execute('SELECT COUNT(*) FROM papers WHERE DATE(created_at) = ?', (today,))
             today_added = cursor.fetchone()[0]
 
             cursor.execute('SELECT AVG(ai_score) FROM papers WHERE ai_processed = 1')
@@ -399,8 +415,6 @@ class Database:
             'recent_syncs': [dict(sync) for sync in recent_syncs]
         }
 
-
-    # Saved synthesis methods
     def save_synthesis(self, paper_ids: List[str], content: str) -> int:
         """Save a generated synthesis to database. Returns new synthesis ID."""
         created_at = datetime.datetime.now().isoformat()
